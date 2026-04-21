@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Virtual environments
+data_exploration/venv/
+
+# Cloned third-party dataset repos and downloaded images (not redistributable)
+data_exploration/datasets/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
