@@ -134,7 +134,7 @@ target captions. Each file under `src/` does one step of that pipeline.
 System-design diagrams + per-milestone execution log live in
 [`Documentation/Progress_2_20260420.md`](Documentation/Progress_2_20260420.md);
 the bird's-eye phase roadmap is in
-[`Documentation/Plan_overmap.md`](Documentation/Plan_overmap.md).
+[`Documentation/Plan_overview.md`](Documentation/Plan_overview.md).
 
 ## Running the baseline
 
