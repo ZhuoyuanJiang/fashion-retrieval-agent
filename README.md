@@ -113,11 +113,91 @@ Defer until the training plan specifies which splits and categories are
 actually needed — pretraining all six FACap categories vs. starting with just
 dress changes the disk and bandwidth footprint significantly.
 
+## Baseline pipeline (`src/`)
+
+The text-modification retrieval baseline (Plan_2). Method: turn
+`(reference image + modification text)` into an "imagined target caption"
+via a VLM, then retrieve via text-to-text similarity against pre-encoded
+target captions. Each file under `src/` does one step of that pipeline.
+
+| File | Role |
+|---|---|
+| `src/data/facap_dataset.py` | `FacapDataset` — iterates FACap CIR triplets; returns 6-key dicts with image **paths** (lazy I/O via `load_image()`) |
+| `src/baseline/text_encoder.py` | Sentence-BERT wrapper (`all-MiniLM-L6-v2`), CPU-only, L2-normalized 384-d output |
+| `src/baseline/build_caption_db.py` | Builds the retrieval index at `runs/<run_name>/caption_db/` (embeddings + metadata + provenance config) |
+| `src/baseline/vlm_caption.py` | Pluggable captioner: `Mock` / `Oracle` / `Qwen2VL` / `SpeechQwen2VL`. Real backends are server-only at ≥14 GB VRAM |
+| `src/baseline/prepare_images.py` | Pre-fetches eval-slice images so real VLM runs don't depend on mid-run network calls |
+| `src/baseline/retrieve.py` | Cosine similarity top-K + true-target rank lookup |
+| `src/baseline/eval.py` | Recall@1/5/10/50 + median + mean rank; writes per-query qualitative JSONL |
+| **`src/baseline/run_baseline.py`** | **Entry point.** Auto-builds the caption DB if missing (with stale-DB gates), runs the full eval loop, writes metrics + qualitative |
+
+System-design diagrams + per-milestone execution log live in
+[`Documentation/Progress_2_20260420.md`](Documentation/Progress_2_20260420.md);
+the bird's-eye phase roadmap is in
+[`Documentation/Plan_overmap.md`](Documentation/Plan_overmap.md).
+
+## Running the baseline
+
+### Conda env
+
+The baseline code runs in a dedicated **conda** env (separate from
+the dataset-exploration `data_exploration/venv/` above):
+
+```bash
+conda env create -f environment.yml
+conda activate fashion_retrieval
+```
+
+Local 8 GB-VRAM laptops can run the mock and oracle backends; the
+real VLM backends (`qwen2vl`, `speechqwen2vl`) raise a clear
+`server-only` RuntimeError below 14 GB VRAM and are intended for the
+GPU server.
+
+### Smoke runs
+
+Two end-to-end runs verify the pipeline:
+
+```bash
+# Oracle: identity-path sanity check; should hit Recall@1 = 1.0.
+# A failure here means the encoder/index/retrieve/rank chain has a bug.
+python -m src.baseline.run_baseline --vlm oracle --n-eval 50 --run-name smoke_oracle
+
+# Mock: numbers don't matter, only that the pipeline runs to completion
+# and writes the expected artifacts.
+python -m src.baseline.run_baseline --vlm mock --n-eval 50 --run-name smoke_mock
+```
+
+Outputs land under `runs/smoke_{oracle,mock}/` (gitignored): the
+auto-built caption DB at `caption_db/`, `metrics.json`, and
+`qualitative/results.jsonl`.
+
+### Tests
+
+Persistent reproducibility checks for M1–M3 — 13 cases across three
+files. Each file is runnable as a script (no pytest dependency) and
+also discoverable by pytest:
+
+```bash
+# Each milestone individually (script mode, prints ✓/✗ per case)
+python -m tests.test_m1_facap_dataset
+python -m tests.test_m2_caption_db
+python -m tests.test_m3_pipeline
+
+# Or all 13 at once via pytest (optional install: pip install pytest)
+pytest tests/
+```
+
+Tests build into fresh `runs/_test_*/` directories so they don't
+collide with your smoke runs.
+
 ## Repo structure
 
 - `Documentation/` — proposals, plans, progress reports, meeting memos.
 - `data_exploration/` — inspection notebook, sample fetchers, scratch space.
 - `scripts/` — reproducibility helpers.
+- `src/` — baseline implementation (Plan_2 M1–M3); entry point is `src/baseline/run_baseline.py`.
+- `tests/` — runnable test suite for M1–M3 (13 cases).
+- `runs/` — gitignored: caption DBs, metrics, qualitative dumps.
 
 ## Licenses
 
