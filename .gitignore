@@ -9,6 +9,7 @@ data_exploration/venv/
 
 # Baseline run artifacts (regenerable; metrics summarized in Documentation/Progress_*.md)
 runs/
+logs/
 
 # Cloned third-party dataset repos and downloaded images (not redistributable)
 data_exploration/datasets/
