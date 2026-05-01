@@ -190,6 +190,100 @@ pytest tests/
 Tests build into fresh `runs/_test_*/` directories so they don't
 collide with your smoke runs.
 
+## Real VLM baseline on a server
+
+Run the headline baseline (`speechqwen2vl` backend, 1000-query FACap
+dress eval slice) on a GPU box. The smoke runs above use mock/oracle
+captioners and run on CPU; the real VLM run needs a GPU.
+
+### Prerequisites
+
+- **NVIDIA GPU with ≥ 14 GB VRAM at bf16.** Qwen2-VL-7B occupies
+  ~15 GB once image tokens are in the mix. Single GPU is enough.
+- **`HF_TOKEN`** set up so model downloads from
+  `DanJZY/Qwen2-VL-7B-Speech` and `Marqo/fashion200k` don't
+  rate-limit. Verify with `huggingface-cli whoami`.
+- **~20 GB free disk** for the Qwen2-VL-7B base + LoRA adapter +
+  caption-DB artifacts. If `~` is tight, set `HF_HOME` to a scratch
+  path before running setup:
+  ```bash
+  export HF_HOME=/scratch/$USER/hf_cache
+  ```
+
+### One-shot setup
+
+Clone this repo and `speechQwen2VL` as siblings, then run the setup
+script:
+
+```bash
+cd ~/CSprojects   # (or wherever; just keep them siblings)
+git clone https://github.com/ZhuoyuanJiang/speechQwen2VL.git
+git clone https://github.com/ZhuoyuanJiang/fashion-retrieval-agent.git
+cd fashion-retrieval-agent
+bash scripts/setup_server.sh
+conda activate fashion_retrieval
+bash scripts/setup_datasets.sh   # FACap + FashionIQ + Fashion200k annotations
+```
+
+`setup_server.sh` creates the `fashion_retrieval` conda env from
+`environment.yml`, installs `requirements.txt`, then shells out to
+`speechQwen2VL/scripts/setup_forks.sh` to install the forked
+`transformers` + `qwen-vl-utils` (these must be installed *last* so
+they override the upstream `transformers` that `sentence-transformers`
+brings in).
+
+### One-shot run
+
+```bash
+bash scripts/run_baseline_v1.sh
+```
+
+Defaults: `n_eval=1000`, `db_size=59082` (full FACap dress targets),
+`vlm=speechqwen2vl`, `run_name=baseline_v1_speechqwen2vl`. Override
+via env vars (e.g.
+`N_EVAL=50 RUN_NAME=smoke_real bash scripts/run_baseline_v1.sh` for
+a quick smoke first).
+
+The script does three things:
+1. Pre-fetches the eval slice's reference images into the local cache
+   (no surprise network calls mid-run).
+2. Runs the baseline: VLM caption-generation + text-to-text retrieval
+   against the 59k FACap dress target captions.
+3. Pretty-prints `metrics.json`.
+
+Outputs land under `runs/<run_name>/`:
+
+```
+runs/baseline_v1_speechqwen2vl/
+  caption_db/
+    embeddings.npy        (N=59082, dim=384) float32
+    metadata.jsonl        target_id, image_path, caption per row
+    config.json           encoder + build_args + facap_commit_sha
+  metrics.json            Recall@1/5/10/50, median + mean rank
+  qualitative/
+    results.jsonl         per-query top-10 + generated caption + true rank
+                          (failure_category field starts blank, fill by hand)
+```
+
+Takes ~20–30 minutes on a single GPU (most time is VLM forward passes).
+
+### Troubleshooting
+
+- **`RuntimeError: server-only: ... needs ≥ 14.0 GB VRAM`** — the
+  selected GPU is too small. Pick a different one with
+  `CUDA_VISIBLE_DEVICES=N`.
+- **Fork override didn't stick.** If
+  `python -c "import transformers; print(transformers.__version__)"`
+  prints `5.x` instead of `4.56.0.dev0`, the `setup_forks.sh` step
+  didn't run. Re-run:
+  `bash ../speechQwen2VL/scripts/setup_forks.sh`.
+- **HF download stalls or 429s.** Set `HF_TOKEN` env var via
+  `huggingface-cli login`.
+- **Stale-DB error.** `runs/<run_name>/caption_db/` was built with
+  different args (encoder, eval size, FACap commit) than this run.
+  Either delete the run dir or use a fresh `--run-name`. The error
+  message names the offending arg(s).
+
 ## Repo structure
 
 - `Documentation/` — proposals, plans, progress reports, meeting memos.
