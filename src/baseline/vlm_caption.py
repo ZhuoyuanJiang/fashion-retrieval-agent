@@ -110,6 +110,11 @@ class _Qwen2VLLikeCaptioner(VLMCaptioner):
         from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
 
         self._torch = torch
+        # TODO(multi-gpu): change device_map="cuda" to device_map="auto" to spread
+        # the model across all available GPUs automatically. Also consider running
+        # N parallel single-GPU processes (one per GPU, CUDA_VISIBLE_DEVICES) for
+        # throughput — each process owns one shard of eval queries. Batch size > 1
+        # helps prefill but not autoregressive generation (the bottleneck at 256 tokens).
         self.model = Qwen2VLForConditionalGeneration.from_pretrained(
             self.BASE_REPO,
             torch_dtype=torch.bfloat16,

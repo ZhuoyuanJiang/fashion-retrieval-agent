@@ -7,18 +7,33 @@ Workflow per query (one FACap triplet):
     4. Score against the true target_id; aggregate Recall@K + ranks.
     5. Save qualitative dump (failure_category to be filled in by hand later).
 
-The smoke runs use the last `--n-eval` triplets (FACap has no formal val
-split — see Plan_2 "FACap evaluation slice" note).
+Caption DB layout (two modes):
+
+  full mode (default, production):
+    runs/caption_db/<encoder_slug>/
+    Built once per encoder. Reused across all eval runs that use the same
+    encoder, regardless of n_eval / VLM / run_name. Encodes ALL targets.
+
+  subset mode (opt-in via --db-size, debug):
+    runs/caption_db_subset/eval{n}_db{m}_seed{s}/<encoder_slug>/
+    Smaller DB for fast iteration: guaranteed eval targets + sampled
+    distractors. Each (eval_n, db_size, seed) triple gets its own dir.
 """
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 from tqdm import tqdm
 
-from src.baseline.build_caption_db import _facap_commit_sha, build_db, build_signature
+from src.baseline.build_caption_db import (
+    _facap_commit_sha,
+    build_db_full,
+    build_db_subset,
+    build_signature_full,
+    build_signature_subset,
+    encoder_slug,
+)
 from src.data.facap_dataset import DEFAULT_FACAP_ROOT
 from src.baseline.eval import (
     compute_metrics,
@@ -34,46 +49,89 @@ from src.data.facap_dataset import DEFAULT_IMAGE_CACHE, FacapDataset, REPO_ROOT
 TOP_K_QUALITATIVE = 10  # how many predictions to dump per query
 
 
+def caption_db_dir(
+    out_root: Path,
+    encoder_name: str,
+    *,
+    db_size: int | None,
+    eval_n: int | None,
+    seed: int | None,
+) -> Path:
+    """Resolve the on-disk DB directory for the given mode.
+
+    Full mode (db_size is None):
+        out_root / caption_db / <encoder_slug>
+    Subset mode:
+        out_root / caption_db_subset / eval{n}_db{m}_seed{s} / <encoder_slug>
+    """
+    enc = encoder_slug(encoder_name)
+    if db_size is None:
+        return out_root / "caption_db" / enc
+    return (
+        out_root
+        / "caption_db_subset"
+        / f"eval{eval_n}_db{db_size}_seed{seed}"
+        / enc
+    )
+
+
 def ensure_caption_db(
     db_dir: Path,
-    run_name: str,
-    eval_n: int,
-    db_size: int,
     category: str,
     split: str,
     encoder_name: str,
-    seed: int,
-    out_root: Path,
+    *,
+    db_size: int | None,
+    eval_n: int | None,
+    seed: int | None,
 ) -> CaptionDB:
     """Load the caption DB at `db_dir`, building it if missing.
 
-    If a DB exists but was built with different args (especially a
-    different encoder, which would put query and DB embeddings in
-    different spaces), refuse to load it — silent reuse here would
-    produce metrics that look fine but are meaningless.
+    Mode is selected by `db_size`:
+      None          -> full mode (encode all captions)
+      int (>0)      -> subset mode (eval_n guaranteed + sampled distractors)
     """
-    expected = build_signature(
-        eval_n=eval_n, db_size=db_size, category=category,
-        split=split, encoder_name=encoder_name, seed=seed,
-    )
-    if not (db_dir / "embeddings.npy").exists():
-        print(f"[caption_db] not found at {db_dir}, building it...")
-        build_db(
-            run_name=run_name,
-            eval_n=eval_n,
-            db_size=db_size,
-            category=category,
-            split=split,
-            encoder_name=encoder_name,
-            seed=seed,
-            out_root=out_root,
+    if db_size is None:
+        expected = build_signature_full(
+            category=category, split=split, encoder_name=encoder_name,
         )
+        if not (db_dir / "embeddings.npy").exists():
+            print(f"[caption_db] full mode: building at {db_dir}...")
+            build_db_full(
+                out_dir=db_dir,
+                category=category,
+                split=split,
+                encoder_name=encoder_name,
+            )
+    else:
+        if eval_n is None or seed is None:
+            raise ValueError(
+                "subset mode (db_size set) requires both eval_n and seed"
+            )
+        expected = build_signature_subset(
+            category=category, split=split, encoder_name=encoder_name,
+            eval_n=eval_n, db_size=db_size, seed=seed,
+        )
+        if not (db_dir / "embeddings.npy").exists():
+            print(
+                f"[caption_db] subset mode (eval_n={eval_n}, db_size={db_size}, "
+                f"seed={seed}): building at {db_dir}..."
+            )
+            build_db_subset(
+                out_dir=db_dir,
+                category=category,
+                split=split,
+                encoder_name=encoder_name,
+                eval_n=eval_n,
+                db_size=db_size,
+                seed=seed,
+            )
+
     db = CaptionDB.load(db_dir)
     existing = db.config.get("build_args")
     if existing is None:
         raise RuntimeError(
-            f"caption DB at {db_dir} was built by an older version of "
-            f"build_caption_db.py and has no `build_args` in config.json. "
+            f"caption DB at {db_dir} has no `build_args` in config.json. "
             f"Delete it (rm -rf {db_dir}) and rerun."
         )
     if existing != expected:
@@ -83,21 +141,16 @@ def ensure_caption_db(
         }
         raise RuntimeError(
             f"caption DB at {db_dir} was built with different args than "
-            f"this run; silent reuse would produce meaningless metrics.\n"
-            f"mismatches: {mismatches}\n"
-            f"either delete it (rm -rf {db_dir}) or use a fresh --run-name."
+            f"this run.\nmismatches: {mismatches}\n"
+            f"Delete it (rm -rf {db_dir}) and rerun."
         )
-    # FACap revision check: if the local FACap clone changed since the DB was
-    # built, the cached captions/triplets may differ from what's on disk now.
     existing_sha = db.config.get("facap_commit_sha")
     current_sha = _facap_commit_sha(DEFAULT_FACAP_ROOT)
     if existing_sha and existing_sha != current_sha:
         raise RuntimeError(
             f"caption DB at {db_dir} was built against FACap commit "
-            f"{existing_sha[:8]} but the local FACap checkout is now at "
-            f"{current_sha[:8]}; silent reuse risks running queries against "
-            f"a different dataset revision than the DB was built from.\n"
-            f"either delete the DB (rm -rf {db_dir}) or use a fresh --run-name."
+            f"{existing_sha[:8]} but local checkout is now at "
+            f"{current_sha[:8]}. Delete it (rm -rf {db_dir}) and rerun."
         )
     return db
 
@@ -108,34 +161,36 @@ def run(
     run_name: str,
     category: str,
     split: str,
-    db_size: int,
     encoder_name: str,
-    seed: int,
     out_root: Path,
     image_cache: Path,
+    *,
+    db_size: int | None = None,
+    seed: int = 42,
 ) -> None:
-    # 1. Dataset + eval slice
+    # 1. Dataset + eval slice (last n_eval triplets)
     ds = FacapDataset(category=category, split=split)
     n_total = len(ds)
     if n_eval > n_total:
         raise ValueError(f"n_eval {n_eval} > total triplets {n_total}")
     eval_indices = list(range(n_total - n_eval, n_total))
 
-    # 2. Caption DB (auto-build at runs/<run_name>/caption_db if missing)
-    run_dir = out_root / run_name
-    db_dir = run_dir / "caption_db"
+    # 2. Caption DB — full mode by default; subset mode if --db-size given.
+    db_dir = caption_db_dir(
+        out_root, encoder_name,
+        db_size=db_size,
+        eval_n=n_eval if db_size is not None else None,
+        seed=seed if db_size is not None else None,
+    )
     db = ensure_caption_db(
         db_dir=db_dir,
-        run_name=run_name,
-        eval_n=n_eval,
-        db_size=db_size,
         category=category,
         split=split,
         encoder_name=encoder_name,
-        seed=seed,
-        out_root=out_root,
+        db_size=db_size,
+        eval_n=n_eval if db_size is not None else None,
+        seed=seed if db_size is not None else None,
     )
-    # Sanity: every eval target should be in the DB (smoke build guarantees it).
     db_id_set = set(db.target_ids)
     eval_targets_in_db = sum(1 for i in eval_indices if ds[i]["target_id"] in db_id_set)
     print(f"[caption_db] {len(db.target_ids)} rows; "
@@ -166,9 +221,7 @@ def run(
             "top10_predicted": [t for t, _ in topk],
             "top10_scores": [round(s, 4) for _, s in topk],
             "rank": r,
-            "failure_category": "",  # filled in by hand later: caption_wrong /
-                                     # embedding_mismatch / dataset_ambiguity /
-                                     # visual_nuance_lost / null
+            "failure_category": "",
         })
 
     # 6. Metrics + outputs
@@ -176,6 +229,7 @@ def run(
     print(f"\n[{vlm}] metrics on {n_eval} queries:")
     print(format_metrics_table(result))
 
+    run_dir = out_root / run_name
     qual_path = write_qualitative(qualitative_rows, run_dir)
     metrics_path = write_metrics(result, run_dir, extra={
         "vlm": vlm,
@@ -183,8 +237,8 @@ def run(
         "category": category,
         "split": split,
         "encoder": encoder_name,
-        "seed": seed,
-        "db_subset": db.config.get("subset_description"),
+        "db_path": str(db_dir),
+        "db_mode": "full" if db_size is None else "subset",
         "facap_commit_sha": db.config.get("facap_commit_sha"),
     })
     print(f"\nwrote qualitative -> {qual_path}")
@@ -199,12 +253,14 @@ def main() -> None:
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--category", default="dress")
     parser.add_argument("--split", default="train")
-    parser.add_argument("--db-size", type=int, default=1000,
-                        help="size of the caption DB if it has to be built (smoke default)")
     parser.add_argument("--encoder", default=DEFAULT_MODEL)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out-root", default=str(REPO_ROOT / "runs"))
     parser.add_argument("--image-cache", default=str(DEFAULT_IMAGE_CACHE))
+    parser.add_argument("--db-size", type=int, default=None,
+                        help="if set, use subset DB of this size for fast debugging "
+                             "(default: full DB encoding all captions)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="subset mode only: seed for distractor sampling")
     args = parser.parse_args()
     run(
         vlm=args.vlm,
@@ -212,11 +268,11 @@ def main() -> None:
         run_name=args.run_name,
         category=args.category,
         split=args.split,
-        db_size=args.db_size,
         encoder_name=args.encoder,
-        seed=args.seed,
         out_root=Path(args.out_root),
         image_cache=Path(args.image_cache),
+        db_size=args.db_size,
+        seed=args.seed,
     )
 
 

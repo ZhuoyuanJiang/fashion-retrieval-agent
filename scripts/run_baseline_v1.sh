@@ -32,10 +32,14 @@
 #
 # Environment variables (optional overrides):
 #   N_EVAL       eval slice size (default: 1000)
-#   DB_SIZE      caption DB size (default: same as full FACap dress targets)
 #   VLM          backend: speechqwen2vl | qwen2vl | oracle | mock (default: speechqwen2vl)
 #   RUN_NAME     run directory name (default: baseline_v1_${VLM})
 #   HF_HOME      HuggingFace cache location (default: ~/.cache/huggingface)
+#   DB_SIZE      OPT-IN: if set, build a subset DB of this size for fast debug
+#                iteration (eval targets guaranteed + sampled distractors).
+#                Unset (default) = full DB encoding all ~59k captions, shared
+#                across runs and reused across n_eval changes.
+#   SEED         subset mode only: seed for distractor sampling (default: 42)
 # =============================================================================
 
 set -e  # exit on any error
@@ -45,15 +49,22 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 N_EVAL="${N_EVAL:-1000}"
-DB_SIZE="${DB_SIZE:-59082}"           # full FACap dress target set
 VLM="${VLM:-speechqwen2vl}"
 RUN_NAME="${RUN_NAME:-baseline_v1_${VLM}}"
+DB_SIZE="${DB_SIZE:-}"      # empty = full mode (default), int = subset mode
+SEED="${SEED:-42}"
+
+if [ -z "$DB_SIZE" ]; then
+    DB_MODE_DESC="full (all captions, shared at runs/caption_db/<enc>/)"
+else
+    DB_MODE_DESC="subset (db_size=$DB_SIZE, seed=$SEED, runs/caption_db_subset/...)"
+fi
 
 echo "=== baseline run config ==="
 echo "  vlm        : $VLM"
 echo "  n_eval     : $N_EVAL"
-echo "  db_size    : $DB_SIZE"
 echo "  run_name   : $RUN_NAME"
+echo "  db_mode    : $DB_MODE_DESC"
 echo "  HF_HOME    : ${HF_HOME:-default (~/.cache/huggingface)}"
 echo ""
 
@@ -73,11 +84,15 @@ python -m src.baseline.prepare_images \
 # ---------- step 2: run the baseline ----------
 echo ""
 echo "=== Step 2/3: run baseline ($VLM, n_eval=$N_EVAL) ==="
-python -m src.baseline.run_baseline \
-    --vlm "$VLM" \
-    --n-eval "$N_EVAL" \
-    --db-size "$DB_SIZE" \
+RUN_BASELINE_ARGS=(
+    --vlm "$VLM"
+    --n-eval "$N_EVAL"
     --run-name "$RUN_NAME"
+)
+if [ -n "$DB_SIZE" ]; then
+    RUN_BASELINE_ARGS+=(--db-size "$DB_SIZE" --seed "$SEED")
+fi
+python -m src.baseline.run_baseline "${RUN_BASELINE_ARGS[@]}"
 
 # ---------- step 3: pretty-print metrics ----------
 echo ""
@@ -93,6 +108,10 @@ echo "=== Baseline run complete ==="
 echo "Artifacts:"
 echo "  runs/$RUN_NAME/metrics.json"
 echo "  runs/$RUN_NAME/qualitative/results.jsonl"
-echo "  runs/$RUN_NAME/caption_db/"
+if [ -z "$DB_SIZE" ]; then
+    echo "  runs/caption_db/<encoder>/  (full DB, shared, reused across runs)"
+else
+    echo "  runs/caption_db_subset/eval${N_EVAL}_db${DB_SIZE}_seed${SEED}/<encoder>/"
+fi
 echo ""
 echo "Next: write Documentation/Baseline_1_Report_<YYYYMMDD>.md from these."
