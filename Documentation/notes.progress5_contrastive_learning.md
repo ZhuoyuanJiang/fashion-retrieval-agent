@@ -1827,3 +1827,375 @@ Eval 分两步：
 我们每 0.5 epoch 跑一次的 dev eval（500 queries × 59k gallery）就是 validation——只是用 R@K 而不是 loss 来表达。这是 retrieval/contrastive learning 的标准做法（CLIP、BLIP、FashionCLIP 都这样）。
 
 没有"validation loss"是刻意的设计，不是遗漏。
+
+---
+
+## Q33: lm_head 是什么？为什么它会占 2.31 GB 显存，即使我们根本不用它的输出？
+
+### 背景
+
+commit message 里写了：*"replaces lm_head with a 1-output stub to eliminate the 2.31 GB (B, seq_len, 152064) bf16 tensor that was causing OOM on RTX 3090 at bs=16"*
+
+### lm_head 是什么
+
+Qwen2-VL 本质是个语言模型，正常用途是生成文字。它的最后一层叫 `lm_head`，作用是把每个 token 的 hidden state（维度 3584）映射到整个词表（152064 个词），这样才能预测下一个词是什么：
+
+```
+hidden_states: (B, seq_len, 3584)
+      ↓ lm_head = Linear(3584, 152064)
+logits:        (B, seq_len, 152064)   ← 每个位置对 152064 个词的打分
+```
+
+### 为什么 OOM 发生在 fix 之前
+
+Plan-5 里我们不生成文字，只取最后一层的 hidden state 的 EOS 位置来算 embedding。所以 `logits` 那个大 tensor 我们完全不用。
+
+**但 PyTorch 的 forward pass 是顺序执行的——不管你用不用输出，只要执行到那一行，tensor 就被分配了：**
+
+```python
+# Qwen2-VL 的 forward() 内部（简化）：
+hidden_states = self.transformer(input_ids, ...)  # 跑完所有 transformer 层
+logits = self.lm_head(hidden_states)              # ← 这行执行时，(B, seq, 152064) 就在显存里分配了
+                                                  #   哪怕你之后根本不用 logits
+return CausalLMOutput(logits=logits, hidden_states=hidden_states)
+
+# 我们的代码只取这个：
+outputs = self.vlm(**inputs, output_hidden_states=True)
+pooled = outputs.hidden_states[-1][...]           # 只用 EOS 位置的 hidden state
+# 但 logits 已经占着 2.31 GB 了，要等 backward 结束才能释放
+```
+
+在 bs=16、序列长度约 509 token 时：
+
+```
+16 × 509 × 152064 × 2 bytes (bf16) ≈ 2.31 GB
+```
+
+RTX 3090 只有 24 GB，forward + backward 的其余部分已经用了约 21 GB，这 2.31 GB 直接把显存撑爆。OOM 发生在 backward pass（因为 forward 分配之后，backward 还需要保留中间激活来计算梯度）。
+
+### Fix
+
+把 `lm_head` 替换成只输出 1 个数的假层（stub）：
+
+```python
+# contrastive_model.py
+_lm_head = vlm.base_model.model.lm_head
+vlm.base_model.model.lm_head = nn.Linear(
+    QWEN2VL_HIDDEN_DIM, 1, bias=False, dtype=torch.bfloat16
+).to(next(_lm_head.parameters()).device)
+del _lm_head
+```
+
+现在那行变成：
+```python
+logits = self.lm_head(hidden_states)  # shape: (B, seq, 1)，几乎不占显存
+```
+
+`lm_head` 不在 LoRA 的 target modules 里，所以没有 trainable 参数受影响。节省 **≈2.3 GB**，bs=16 在 RTX 3090 上就能跑了。
+
+### 补充："分配"和"backward 才释放"是什么意思
+
+**"分配"** = 在 GPU 显存里划出一块物理空间，把数字存进去。GPU 显存就像 RAM，是有限的物理空间，存了东西就被占用。
+
+```python
+logits = self.lm_head(hidden_states)
+```
+
+这行执行完，GPU 显存里就多了 2.31 GB 的数字。不管后面用不用、return 不 return，**数字已经在那里了**。`return` 只是 Python 层面传引用，跟 GPU 显存里的物理数据无关：
+
+```python
+# 这两种写法，显存占用完全一样：
+logits = self.lm_head(hidden_states)
+return logits          # 写法 A：return 出去
+
+logits = self.lm_head(hidden_states)
+return hidden_states   # 写法 B：不 return logits — logits 还是在显存里！
+```
+
+**为什么要等 backward 结束才释放：** PyTorch autograd 在 forward 时记了一张计算图，backward 计算梯度时需要把 forward 的中间 tensor 再拿出来用。所以 forward 跑完后，那些中间 tensor 不能释放，要等 backward 把梯度全算完才统一清理。OOM 发生在 backward 正是因为那时显存压力最大：forward 留下的所有中间 tensor 都还在，backward 自己还要额外分配梯度 tensor。
+
+### 实际的代码改动
+
+```python
+# contrastive_model.py — 模型加载完之后立即替换 lm_head
+
+_lm_head = vlm.base_model.model.lm_head          # 存起来只是为了拿它的 device
+vlm.base_model.model.lm_head = nn.Linear(
+    QWEN2VL_HIDDEN_DIM, 1,                        # 输出从 152064 改成 1
+    bias=False, dtype=torch.bfloat16
+).to(next(_lm_head.parameters()).device)          # 放到跟原来同一张 GPU
+del _lm_head                                      # 原来那个大层彻底删掉，释放权重显存
+```
+
+之后 forward 里那行变成：
+```python
+logits = self.lm_head(hidden_states)
+# shape: (B, seq_len, 1) 而不是 (B, seq_len, 152064)
+# 16 × 509 × 1 × 2 bytes ≈ 0.016 MB，可以忽略不计
+```
+
+我们仍然取 `outputs.hidden_states[-1]`，lm_head 的输出继续被无视——但现在那个"被无视的 tensor"只有 16 KB 而不是 2.31 GB。
+
+---
+
+## Q34: `PeftModel.from_pretrained` 的 `device_map` vs `torch_device` bug
+
+### 背景
+
+commit message 里写了：*"Fixed PeftModel.from_pretrained to pass torch_device= instead of device_map= so LoRA adapter weights load to the correct per-rank GPU under DDP (device_map triggers HF dispatch_model which always placed weights on GPU 0)"*
+
+### DDP 里每个进程应该做什么
+
+8 卡 DDP 训练时，8 个进程（rank 0–7）各自跑一份完整的模型，每个进程应该把模型加载到自己对应的 GPU（rank 0 → GPU 0，rank 1 → GPU 1……）。
+
+### bug 的完整路径
+
+先看 PEFT 源码的关键片段：
+
+```python
+# peft/utils/other.py
+def infer_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"    # 永远返回 "cuda"，即 GPU 0
+    ...
+```
+
+```python
+# peft/peft_model.py — load_adapter() 方法
+def load_adapter(self, ..., torch_device=None, ...):
+    if torch_device is None:
+        torch_device = infer_device()   # ← 如果没有显式传 torch_device，就用 GPU 0
+
+    adapters_weights = load_peft_weights(
+        model_id, device=torch_device, ...   # adapter 权重放到 torch_device 指定的位置
+    )
+```
+
+`PeftModel.from_pretrained()` 最终会把 `**kwargs` 原封不动传给 `load_adapter()`。问题在于：
+
+```
+你调：PeftModel.from_pretrained(model, lora_repo, device_map="cuda:1")
+                                                   ↑
+                                          进了 **kwargs，不是 torch_device=
+
+→ from_pretrained 把 **kwargs 传给 load_adapter(**kwargs)
+
+→ load_adapter 签名是 load_adapter(self, ..., torch_device=None, ...)
+  你传的是 device_map=，不是 torch_device=
+  所以 torch_device 依然是 None
+
+→ torch_device = infer_device()  →  "cuda"  →  GPU 0
+
+→ 8 个 DDP 进程全部把 LoRA 权重放到 GPU 0 → OOM
+```
+
+### Fix
+
+```python
+# vlm_caption.py — _load_qwen2vl_base()
+
+# 错误写法：
+model = PeftModel.from_pretrained(model, lora_repo, device_map=device_map)
+
+# 正确写法：
+torch_device = device_map if isinstance(device_map, str) else None
+model = PeftModel.from_pretrained(model, lora_repo, torch_device=torch_device)
+#                                                    ↑
+#                          load_adapter 里 torch_device 不为 None
+#                          跳过 infer_device()，直接用 "cuda:1"（或对应的 rank GPU）
+```
+
+`torch_device` 的语义是"把这些 tensor 直接放到这张卡上"，不触发任何模型并行逻辑。
+
+---
+
+## Q35: `encode_image` 怎么实现的？open_clip 又是什么？
+
+### open_clip 是什么
+
+CLIP（OpenAI 提出）是用大量图文对做对比学习的模型，目标是让图片和文字的 embedding 落在同一个向量空间里（所以可以用文字搜图）。`open_clip` 是 LAION 社区的开源复现版，我们用的 **FashionCLIP** 就是在时装数据上 fine-tune 的 open_clip 模型。
+
+```python
+import open_clip
+model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms("hf-hub:Marqo/marqo-fashionCLIP")
+```
+
+返回三样东西：
+- `model`：有 `.encode_image()` 和 `.encode_text()` 两个方法
+- `preprocess_train`：训练时的图片预处理（含随机裁剪等数据增强）
+- `preprocess_val`：推理时的图片预处理（确定性变换：resize → center crop → ToTensor → Normalize）
+
+`preprocess_val` 本质是一个 `torchvision.transforms.Compose`，必须和训练时一致，否则图片分布对不上，embedding 会偏移。
+
+### encode_image 的实现
+
+原来的 `_OpenClipWrapper` 只包装了文字编码（`.encode(texts)`），没有图片编码接口。我们在 target_cache.py 里需要把 59k 张图片全部编码成向量，所以加了 `.encode_image(images)`：
+
+```python
+class _OpenClipWrapper:
+    def __init__(self, model, tokenizer, preprocess_val, device, max_seq_length):
+        self.model = model.to(device).eval()
+        self.tokenizer = tokenizer
+        self.preprocess_val = preprocess_val   # ← 新加：推理预处理函数
+        self.device = device
+
+    def encode_image(self, images, batch_size=32):
+        """PIL images → L2-normalized float32 ndarray (N, D)"""
+        out = []
+        with torch.no_grad():
+            for i in range(0, len(images), batch_size):
+                chunk = images[i:i + batch_size]
+                tensors = torch.stack(
+                    [self.preprocess_val(img) for img in chunk]  # PIL → tensor（resize/normalize）
+                ).to(self.device)
+                feats = self.model.encode_image(tensors)         # open_clip 的图片编码
+                feats = feats / feats.norm(dim=-1, keepdim=True) # L2 normalize
+                out.append(feats.cpu().float().numpy())
+        return np.concatenate(out, axis=0)   # shape: (N, D), float32
+```
+
+`preprocess_val` 原来在 `_load_open_clip` 里被丢掉了：
+
+```python
+# 原来（broken）：
+model, _, _ = open_clip.create_model_and_transforms(...)
+#              ↑ preprocess_val 是第三个返回值，用 _ 丢掉了
+
+# 修复后：
+model, _, preprocess_val = open_clip.create_model_and_transforms(...)
+return _OpenClipWrapper(model, tokenizer, preprocess_val, ...)   # 存进 wrapper
+```
+
+### 为什么需要 encode_image
+
+Plan-5 的训练目标是：让 Qwen2-VL 的 query embedding 和 **FashionCLIP 图片 tower 算出来的 target embedding** 对齐。Target embedding 是固定的（FashionCLIP 冻结），所以训练前把 59k 张图全部编码一次存起来（`target_cache.py`），训练时直接按 `target_id` 查表，不需要每个 step 重新跑 FashionCLIP。`encode_image` 就是用来做这个离线编码的。
+
+---
+
+## Q36: Contrastive learning 的 dataset 是怎么构造的？negative 是什么？为什么 batch 越大越好？
+
+### Dataset 的结构
+
+我们的任务：给定一张候选图片 + 一段修改文字，找到目标图片。
+
+Dataset 里每条数据是一个 **triplet（三元组）**：
+
+```
+(候选图片, 修改文字, 目标图片)
+
+例如：
+  候选图片: 一件红色连衣裙
+  修改文字: "make it blue and shorter"
+  目标图片: 一件蓝色短裙
+```
+
+`FacapContrastiveDataset.__getitem__` 返回的就是：
+
+```python
+return (cand_image_PIL, mod_text_str, target_id)
+#       候选图片         修改文字        目标图片的 ID（用来查 embedding 缓存）
+```
+
+### Negative 是什么
+
+模型的目标：**query embedding（候选图 + 修改文字）应该离正确的 target embedding 近，离其他所有 target embedding 远。**
+
+"其他所有 target embedding"就是 **negatives（负样本）**：
+
+```
+query: "红裙子，改成蓝色短裙"
+
+✅ positive:  蓝色短裙的 embedding   ← 应该靠近
+❌ negative:  绿色长裙的 embedding   ← 应该推远
+❌ negative:  白色上衣的 embedding   ← 应该推远
+❌ negative:  黑色裤子的 embedding   ← 应该推远
+...（gallery 里其他所有图片）
+```
+
+### In-batch Negatives
+
+理想情况下每个 query 对着 59k 个 negatives 训练，但计算量太大。**In-batch negatives** 的思路：**同一个 batch 里其他样本的 target，就当作这个 query 的 negative**，不需要额外采样：
+
+```
+batch 里有 4 个样本：
+  query_1 → target_1  (红裙→蓝裙)
+  query_2 → target_2  (牛仔裤→黑裤)
+  query_3 → target_3  (白T恤→条纹T)
+  query_4 → target_4  (运动鞋→皮鞋)
+
+对 query_1：
+  ✅ positive: target_1
+  ❌ negative: target_2, target_3, target_4  ← 借用同 batch 里其他人的 target
+```
+
+### InfoNCE Loss 怎么算
+
+把 batch 里所有 query 和所有 target 的相似度算成一个矩阵，Loss 让对角线最大、非对角线最小：
+
+```
+              target_1  target_2  target_3  target_4
+query_1  →  [  高,       低,       低,       低   ]  ← 希望第 1 个最高
+query_2  →  [  低,       高,       低,       低   ]
+query_3  →  [  低,       低,       高,       低   ]
+query_4  →  [  低,       低,       低,       高   ]
+```
+
+本质是 N 分类的交叉熵：对 query_1，在 N 个候选里做 softmax，希望 target_1 的概率趋近于 1。
+
+### 为什么 batch 越大越好
+
+**negatives 越多，任务越难，loss 给的梯度信号越有区分度。**
+
+```
+batch=4:   在 4 选 1，随机猜有 25% 概率对  → loss 饱和快，模型学不到什么
+batch=64:  在 64 选 1，有类似颜色的干扰项  → 模型必须真正理解修改文字
+batch=512: 在 512 选 1，大量外观相近的混淆项 → 学得更精细
+```
+
+batch 大了之后，同一个 batch 里自然会出现外观相似但不是正确答案的图（**hard negatives**），这些才是真正有价值的训练信号。
+
+数学上：InfoNCE loss 的理论下界是 `-log(1/N)`，N 越大，loss 的动态范围越大，梯度越有区分度。
+
+实验也验证了这一点：bs=64（512 effective）的 v3 run 比 bs=8（64 effective）收敛更快，每步学到的东西更多。
+
+### 我们用 all_gather 进一步扩大 effective batch
+
+8 张 GPU，每张 bs=64。如果每张卡只用自己的数据算 loss，effective batch = 64。用 `--gather` 后，每张卡做完 forward，把所有卡的 embeddings 汇总再算 loss：
+
+```
+GPU 0 ~ GPU 7，每张各有 64 个 query + 64 个 target embedding
+
+all_gather → 把 8 × 64 = 512 个 target embeddings 汇总
+
+每个 query 现在对着 512 个 negatives 训练
+```
+
+server 10 的 effective batch = 64 × 8 = **512**，是 bs=8 run 的 8 倍，理论上应该能突破 bs=8 的 R@10=0.226 瓶颈——但实验还在进行中，见下表。
+
+### 各 batch size 的 epoch 对比（截至 2026-05-03）
+
+Step 单位没法跨 batch size 比较（bs=64 每步用 512 个样本，bs=8 只用 64 个），统一用 epoch：
+
+| Epoch | bs=8 R@10 | bs=64 R@10 | bs=16 v4 R@10 |
+|-------|-----------|------------|---------------|
+| 0.5   | 0.166     | 0.008      | 0.168         |
+| 1.0   | 0.182     | 0.054      | —             |
+| 1.5   | —         | 0.082      | **0.196**     |
+| ~1.8  | **0.226** | —          | —             |
+| 2.0   | 0.216     | 0.122      | —             |
+| 2.5   | 0.220     | 0.154      | —             |
+| 3.0   | —         | 0.114 †    | —             |
+| 3.5   | —         | 0.188      | —             |
+| 4.0   | —         | 0.198      | —             |
+| 4.5   | —         | 0.212      | —             |
+| 5.0   | —         | **0.222**  | —             |
+
+† temperature reset on resume，人为因素导致下降
+
+**从这张表看，bs=8 目前数值最高（0.226）——但结论要小心：**
+
+- bs=8 在 epoch ~1.8 达到峰值后就 **plateau** 了，epoch 2.0 之后没有继续涨
+- bs=64 在 epoch 5.0 还在上升（每半 epoch 涨约 0.01），距离 0.226 只差 0.004
+- bs=16 v4 在 epoch 1.5 只有 0.196，trajectory 很陡，还在快速上升，没有 plateau 迹象
+
+**结论（当前）：** bs=8 收敛最快，但也 plateau 最早。bs=16/bs=64 收敛慢，但上限可能更高。理论上更多 negatives 应该给更高的上限（更难的对比任务 → 更好的 representation），实验还需要再跑几个 epoch 才能确认。

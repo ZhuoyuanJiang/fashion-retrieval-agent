@@ -166,9 +166,13 @@ class ContrastiveQwen2VL(nn.Module):
             use_cache=False,
         )
 
-        # EOS-position: last real token per sample (robust to left/right padding)
+        # Index of the last real (non-pad) token — works for both left and right
+        # padding by finding the rightmost 1 in each attention_mask row.
+        # (Qwen2-VL uses left padding; sum-1 would point into the pad region.)
         last_hs = outputs.hidden_states[-1]  # (B, seq_len, 3584), bf16
-        seq_ends = inputs["attention_mask"].sum(dim=1) - 1  # (B,)
+        seq_len = inputs["attention_mask"].shape[1]
+        seq_ends = (seq_len - 1
+                    - inputs["attention_mask"].flip(dims=[1]).long().argmax(dim=1))  # (B,)
         pooled = last_hs[torch.arange(B, device=device), seq_ends, :]  # (B, 3584)
 
         # Projection + L2 normalize (in fp32)

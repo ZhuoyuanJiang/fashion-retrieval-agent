@@ -262,6 +262,8 @@ def main() -> None:
             raise ValueError(f"--d-target {args.d_target} conflicts with cache dim {d_target}")
         gallery_lookup = make_gallery_lookup(embeddings, gallery_ids)
         gallery_db = make_gallery_db(embeddings, gallery_ids)
+        # Integer index for each gallery ID — used by multi-positive InfoNCE mask
+        tid_to_idx: dict[str, int] = {gid: i for i, gid in enumerate(gallery_ids)}
         accelerator.print(
             f"Gallery cache: {len(gallery_ids)} images, dim={d_target}, "
             f"{embeddings.nbytes / 1e6:.0f} MB"
@@ -386,7 +388,10 @@ def main() -> None:
 
             # Forward + loss
             q_embs = model(cand_images, mod_texts, max_mod_len=args.max_mod_len)
-            loss = loss_fn(q_embs, t_embs, gather=args.gather)
+            tid_tensor = torch.tensor(
+                [tid_to_idx[tid] for tid in target_ids], dtype=torch.int64, device=device
+            )
+            loss = loss_fn(q_embs, t_embs, gather=args.gather, target_ids=tid_tensor)
 
             # Hard stop on numerical failure
             if not torch.isfinite(loss):
@@ -406,10 +411,9 @@ def main() -> None:
 
             optimizer.step()
 
-            # Clamp logit_scale after every step
-            if accelerator.is_main_process:
-                unwrapped_loss = accelerator.unwrap_model(loss_fn)
-                unwrapped_loss.clamp_logit_scale()
+            # Clamp logit_scale after every step (all ranks — clamp modifies .data
+            # directly, bypassing DDP sync, so every rank must clamp independently)
+            accelerator.unwrap_model(loss_fn).clamp_logit_scale()
 
             # ----------------------------------------------------------
             # Logging
@@ -419,7 +423,7 @@ def main() -> None:
                 log_dict = {
                     "train/loss":       loss.item(),
                     "train/logit_scale": unwrapped_loss.logit_scale.exp().item(),
-                    "train/epoch":      epoch + global_step / steps_per_epoch,
+                    "train/epoch":      global_step / steps_per_epoch,
                     "train/lr_lora":    optimizer.param_groups[0]["lr"],
                     "train/lr_proj":    optimizer.param_groups[1]["lr"],
                     "train/grad_norm":  grad_norm,
@@ -452,20 +456,6 @@ def main() -> None:
                 shuffled = probe["mod_shuffled"]
                 sensitivity_gap = normal.recall[10] - stripped.recall[10]
 
-                metric_row = {
-                    "step": global_step,
-                    "epoch_frac": epoch + global_step / steps_per_epoch,
-                    "dev/r1_normal":      normal.recall[1],
-                    "dev/r5_normal":      normal.recall[5],
-                    "dev/r10_normal":     normal.recall[10],
-                    "dev/r50_normal":     normal.recall[50],
-                    "dev/median_rank":    normal.median_rank,
-                    "dev/r10_stripped":   stripped.recall[10],
-                    "dev/r10_shuffled":   shuffled.recall[10],
-                    "dev/sensitivity_gap": sensitivity_gap,
-                }
-                all_metrics.append(metric_row)
-
                 # Headline eval (1000 queries, authoritative)
                 headline_result = run_retrieval_eval(
                     unwrapped_model,
@@ -474,15 +464,27 @@ def main() -> None:
                     base_ds,
                 )
 
+                metric_row = {
+                    "step": global_step,
+                    "epoch_frac": global_step / steps_per_epoch,
+                    "dev/r1_normal":      normal.recall[1],
+                    "dev/r5_normal":      normal.recall[5],
+                    "dev/r10_normal":     normal.recall[10],
+                    "dev/r50_normal":     normal.recall[50],
+                    "dev/median_rank":    normal.median_rank,
+                    "dev/r10_stripped":   stripped.recall[10],
+                    "dev/r10_shuffled":   shuffled.recall[10],
+                    "dev/sensitivity_gap": sensitivity_gap,
+                    "headline/r1":          headline_result.recall[1],
+                    "headline/r5":          headline_result.recall[5],
+                    "headline/r10":         headline_result.recall[10],
+                    "headline/r50":         headline_result.recall[50],
+                    "headline/median_rank": headline_result.median_rank,
+                }
+                all_metrics.append(metric_row)
+
                 accelerator.log(
-                    {
-                        **{k: v for k, v in metric_row.items() if k != "step"},
-                        "headline/r1":          headline_result.recall[1],
-                        "headline/r5":          headline_result.recall[5],
-                        "headline/r10":         headline_result.recall[10],
-                        "headline/r50":         headline_result.recall[50],
-                        "headline/median_rank": headline_result.median_rank,
-                    },
+                    {k: v for k, v in metric_row.items() if k != "step"},
                     step=global_step,
                 )
                 accelerator.print(

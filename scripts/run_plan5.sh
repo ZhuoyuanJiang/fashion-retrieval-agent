@@ -21,6 +21,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Ensure HF caches land on local SSD, not NAS home quota
+export HF_HOME="${HF_HOME:-/ssd1/zhuoyuan/hf_cache}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}}"
+export WANDB_DIR="${WANDB_DIR:-/ssd1/zhuoyuan/wandb_cache}"
+
+CONDA_PYTHON="$(conda run -n fashion_retrieval which python 2>/dev/null || echo python)"
+CONDA_ACCEL="$(conda run -n fashion_retrieval which accelerate 2>/dev/null || echo accelerate)"
+
 # ── Defaults ────────────────────────────────────────────────────────────────
 ENCODER_ID="marqo-fashionclip"
 CACHE_DIR="runs/plan5"
@@ -56,7 +65,7 @@ fi
 
 # ── Step 2: Launch training ──────────────────────────────────────────────────
 TRAIN_CMD=(
-    python src/training/train_plan5.py
+    "$CONDA_PYTHON" src/training/train_plan5.py
     --encoder-id "$ENCODER_ID"
     --cache-dir  "$CACHE_DIR"
     --run-dir    "$RUN_DIR"
@@ -66,7 +75,7 @@ TRAIN_CMD=(
 if [[ $MULTI_GPU -eq 1 ]]; then
     echo "=== Multi-GPU launch (${NUM_GPUS} GPUs) ==="
     TRAIN_CMD=(
-        accelerate launch
+        "$CONDA_ACCEL" launch
         --num_processes "$NUM_GPUS"
         src/training/train_plan5.py
         --encoder-id "$ENCODER_ID"
