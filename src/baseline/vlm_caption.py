@@ -28,6 +28,50 @@ from PIL import Image
 MIN_VRAM_GB_FOR_QWEN2VL_7B = 14.0
 
 
+def _load_qwen2vl_base(
+    base_repo: str,
+    lora_repo: str | None = None,
+    merge_stage2: bool = False,
+    device_map: str | dict = "cuda:0",
+):
+    """Load Qwen2-VL-7B model + processor. Returns (model, processor).
+
+    If lora_repo is given, loads the Stage-2 LoRA adapter on top.
+    merge_stage2=True: folds Stage-2 weights via merge_and_unload() so a
+    fresh Plan-5 LoRA can be attached on top (~30s startup overhead).
+    merge_stage2=False: returns PeftModel with adapter live, intended for
+    captioning where Stage-2 should stay active.
+    """
+    import torch
+    from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
+
+    model = Qwen2VLForConditionalGeneration.from_pretrained(
+        base_repo,
+        torch_dtype=torch.bfloat16,
+        device_map=device_map,
+    )
+    model.config.use_cache = True
+
+    if lora_repo:
+        from peft import PeftModel
+        # torch_device controls where load_peft_weights places adapter weights;
+        # device_map would trigger dispatch_model (model parallelism) instead.
+        torch_device = device_map if isinstance(device_map, str) else None
+        model = PeftModel.from_pretrained(model, lora_repo, torch_device=torch_device)
+        if merge_stage2:
+            model = model.merge_and_unload()
+            # Remove residual PEFT attrs so a fresh adapter can be attached cleanly
+            for _attr in ("peft_config", "active_adapter", "active_adapters"):
+                try:
+                    delattr(model, _attr)
+                except AttributeError:
+                    pass
+
+    model.eval()
+    processor = Qwen2VLProcessor.from_pretrained(base_repo)
+    return model, processor
+
+
 def _check_can_host_qwen2vl_7b(model_label: str) -> None:
     """Raise RuntimeError if this machine can't hold Qwen2-VL-7B at bf16."""
     import torch
@@ -107,25 +151,12 @@ class _Qwen2VLLikeCaptioner(VLMCaptioner):
 
     def _load_model(self) -> None:
         import torch
-        from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
-
         self._torch = torch
-        # TODO(multi-gpu): change device_map="cuda" to device_map="auto" to spread
-        # the model across all available GPUs automatically. Also consider running
-        # N parallel single-GPU processes (one per GPU, CUDA_VISIBLE_DEVICES) for
-        # throughput — each process owns one shard of eval queries. Batch size > 1
-        # helps prefill but not autoregressive generation (the bottleneck at 256 tokens).
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-            self.BASE_REPO,
-            torch_dtype=torch.bfloat16,
-            device_map="cuda",
+        self.model, self.processor = _load_qwen2vl_base(
+            base_repo=self.BASE_REPO,
+            lora_repo=self.LORA_REPO,
+            merge_stage2=False,
         )
-        self.model.config.use_cache = True
-        if self.LORA_REPO:
-            from peft import PeftModel
-            self.model = PeftModel.from_pretrained(self.model, self.LORA_REPO)
-        self.model.eval()
-        self.processor = Qwen2VLProcessor.from_pretrained(self.BASE_REPO)
 
     def _resolve_image_path(self, item: dict[str, Any]) -> Path:
         image_id = item["candidate_id"]

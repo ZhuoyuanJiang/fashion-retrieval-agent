@@ -85,16 +85,18 @@ def _load_st_model(cfg: EncoderConfig):
 
 
 class _OpenClipWrapper:
-    """Minimal duck-typed shim so callers can treat open_clip text encoders
+    """Minimal duck-typed shim so callers can treat open_clip encoders
     as if they were a sentence-transformers model.
 
-    Supports `.encode(texts, ...)` returning an L2-normalized np.ndarray.
+    Supports `.encode(texts, ...)` for text and `.encode_image(images, ...)`
+    for PIL images, both returning L2-normalized np.ndarray.
     Used for Marqo Fashion CLIP/SigLIP, which choke on the sentence-transformers
     -> transformers loader path (meta-tensor errors).
     """
-    def __init__(self, model, tokenizer, device: str, max_seq_length: int | None):
+    def __init__(self, model, tokenizer, preprocess_val, device: str, max_seq_length: int | None):
         self.model = model.to(device).eval()
         self.tokenizer = tokenizer
+        self.preprocess_val = preprocess_val
         self.device = device
         self.max_seq_length = max_seq_length
 
@@ -112,12 +114,26 @@ class _OpenClipWrapper:
                 out.append(feats.cpu().float().numpy())
         return np.concatenate(out, axis=0)
 
+    def encode_image(self, images, batch_size=32):
+        """Encode PIL images to L2-normalized float32 np.ndarray (N, D)."""
+        out = []
+        with torch.no_grad():
+            for i in range(0, len(images), batch_size):
+                chunk = images[i:i + batch_size]
+                tensors = torch.stack(
+                    [self.preprocess_val(img) for img in chunk]
+                ).to(self.device)
+                feats = self.model.encode_image(tensors)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                out.append(feats.cpu().float().numpy())
+        return np.concatenate(out, axis=0)
+
 
 def _load_open_clip(cfg: EncoderConfig) -> _OpenClipWrapper:
     import open_clip
-    model, _, _ = open_clip.create_model_and_transforms(cfg.hf_model_id)
+    model, _, preprocess_val = open_clip.create_model_and_transforms(cfg.hf_model_id)
     tokenizer = open_clip.get_tokenizer(cfg.hf_model_id)
-    return _OpenClipWrapper(model, tokenizer, _device(), cfg.max_seq_length)
+    return _OpenClipWrapper(model, tokenizer, preprocess_val, _device(), cfg.max_seq_length)
 
 
 def _pre_truncate(model, texts: list[str], max_len: int) -> list[str]:

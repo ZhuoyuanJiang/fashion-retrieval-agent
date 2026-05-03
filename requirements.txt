@@ -76,3 +76,6 @@ sentence-transformers==3.4.1
 
 # --- HTTP for streaming Marqo/fashion200k images ---
 requests==2.32.3
+
+# --- Plan-5 contrastive training additions ---
+open_clip_torch

@@ -1600,3 +1600,230 @@ multimodal Qwen2-VL，target 边只用 FashionCLIP 的图 tower。
 我们提前用 FashionCLIP 把所有 target 图算成靶子坐标存下来，training 时
 就是让 Qwen2-VL 学怎么把 query 投射到正确的靶子坐标上。FashionCLIP 本身
 全程不动，loss 也不会 backprop 经过它。**
+
+## Q29: Dataset class 的设计——`__getitem__` return paths 还是 PIL？跟 Phase A 的 `FacapDataset` 不一样有没有问题？放哪个文件夹？
+
+### 背景
+
+Phase A 的 `src/data/facap_dataset.py` 里 `FacapDataset.__getitem__` 返回的是
+**只有 string 字段的 dict**（`candidate_image_path`、`modification_text`、
+`target_caption`、`target_id` 等），PIL 通过单独的 `load_image(item, side)`
+方法才打开。
+
+Plan 5 contrastive 训练我最初的草案里写的是 `(cand_image, mod_text, target_id)`
+——直接 return PIL。这是两种不同的设计模式。
+
+### 两种模式各自的适用场景
+
+**Phase A 模式（return paths + 单独的 `load_image()`）**
+- ✅ 适合 caption-then-retrieve：99% 的访问只需要 `target_caption` + `target_id`，
+  根本不需要 PIL。如果 `__getitem__` 强制 decode jpeg，每访问一条 triplet 就读
+  一张图，**纯属浪费**——因为 caption-based pipeline 永远不会真正用到那张图。
+- ✅ 内存非常 cheap：只存 strings，59k 条 triplets 全部塞进 RAM 没压力。
+- ❌ Caller 要记得调 `load_image()`，多一步——但因为 Phase A 几乎不需要 PIL，
+  这"一步"几乎不发生。
+
+**Plan 5 模式（return PIL）**
+- 训练每个 step 一定要 `cand_image` PIL（VLM 要吃 `(ref_image, mod_text)` 进去），
+  **不可能跳过 decode**。
+- Sensitivity probe 要 mod-stripped / mod-shuffled 三种变体，但 `cand_image`
+  在三种变体里都一样——不会重复 decode。
+- 这种 "每个 item 都需要 PIL" 的场景，**直接在 `__getitem__` return PIL 是
+  PyTorch 的标准 pattern**：DataLoader 的 `num_workers > 0` 会让 worker 进程
+  并行 decode，跟训练的 GPU forward 在 pipeline 上重叠，相当于免费拿到并行 I/O。
+
+**关键区别不在于"哪个更好"，而在于"哪个匹配你的 access pattern"**：
+- Phase A 的 access pattern 是 sparse（绝大多数访问不需要 PIL）→ 返回 paths
+- Plan 5 的 access pattern 是 dense（每次访问都需要 PIL）→ 返回 PIL
+
+两个都是合理设计，**不是矛盾，是两种 pattern 各自最优**。
+
+### 修订后的设计：wrap 而不是重写
+
+不要把 `FacapDataset` 的 triplet/caption 加载逻辑在 Plan 5 里再写一遍。新类
+（暂叫 `FacapContrastiveDataset`）应该 **compose / wrap 现有的 `FacapDataset`**：
+
+- L2 filtering、dev slice 切分、sensitivity probe 的 mod-shuffled 变体——
+  这些 Plan 5-specific 的逻辑都加在新类里。
+- 实际读 metadata 还是走 `FacapDataset`（single source of truth）。
+- `__getitem__` 末尾调 `base.load_image(item, "candidate")` 拿 PIL。
+- 这样 Phase A 的代码完全不受影响；如果以后 FACap 数据格式变了，只有
+  `FacapDataset` 需要改。
+
+伪代码：
+
+```python
+class FacapContrastiveDataset(Dataset):
+    def __init__(self, base: FacapDataset, exclusion_ids: set[str], ...):
+        self.base = base
+        # 在 base 的全部 indices 里筛掉 L2 排除的 triplets
+        self.indices = [i for i in range(len(base))
+                        if base[i]["target_id"] not in exclusion_ids
+                        and base[i]["candidate_id"] not in exclusion_ids]
+
+    def __getitem__(self, idx):
+        item = self.base[self.indices[idx]]                # metadata
+        cand_image = self.base.load_image(item, "candidate")  # PIL
+        return {
+            "cand_image": cand_image,
+            "mod_text": item["modification_text"],
+            "target_id": item["target_id"],
+        }
+```
+
+### Folder 放哪
+
+**`src/data/contrastive_dataset.py`**，跟 `facap_dataset.py` 平级——所有
+dataset 类放一起，更连贯。
+
+判断标准：
+- `src/data/` —— 跟数据集本身相关的（FACap 的 schema、L2 filtering、image
+  loading），换数据集的话整个文件夹都要重写。
+- `src/training/` —— 纯训练 infra（loss、model wrapper、loop、target cache、
+  online eval），换数据集这些代码完全不动。
+
+`FacapContrastiveDataset` 的逻辑（L2 排除、dev slice 切分、sensitivity
+probe 数据组织）都跟 FACap 的 schema 紧耦合，所以放 `src/data/` 更合适。
+
+### 一句话总结
+
+**Phase A 返回 paths 是因为 99% 的访问不需要 PIL；Plan 5 返回 PIL 是因为
+100% 的访问都需要。两个设计都对，匹配各自的 access pattern。新类 wrap 老类
+而不是重写，dataset 都放 `src/data/` 一个文件夹里。**
+
+## Q30: 我们训练 Qwen2-VL 的哪些 layers？Prompt 怎么给？对结果有什么影响？
+
+### 训练哪些 layers
+
+**训练的：**
+- LoRA on `q_proj`, `k_proj`, `v_proj`, `o_proj`（LLM decoder 每一层的注意力权重，rank=32, alpha=64）— ~28M 参数
+- Projection head（3584 → 1024 → 512，GELU + LayerNorm）— ~4.2M 参数
+- `logit_scale`（InfoNCE temperature，单个标量）
+
+**冻结的：**
+- Vision tower（ViT 图像编码部分）
+- LLM 所有 MLP 层（`gate_proj`, `up_proj`, `down_proj`）
+- Token embedding 层
+- LLM base weights（只有 LoRA delta 参与梯度）
+
+### 为什么只训 q/k/v/o，不训 MLP？
+
+注意力机制（q/k/v/o）控制"哪些 token 和哪些 token 交互"——这是把图像 token 和文字 token 融合在一起的关键。训 LoRA 在这里 = 教模型如何把图像信息和修改文字信息 aggregate 到 EOS position。
+
+MLP（gate/up/down_proj）是每个 token 自身的特征变换，不控制跨 token 信息流。它们的参数量是 attention 的约 3 倍（Qwen2-VL-7B: intermediate_size=18944, hidden=3584）。不训它们的理由：
+1. VRAM 太大（每层 MLP LoRA 参数量是 attention LoRA 的 ~3×）
+2. MLP 存储"语言知识"，改了更容易 catastrophic forgetting
+3. 我们需要的跨模态信息融合是 attention 的职责
+
+Token embedding 不训：改了会破坏所有文字 token 的表示，几乎所有 fine-tuning 都不动它。
+
+### Stage-2 ASR LoRA 和当前 task 的关系
+
+Stage-2 LoRA（ASR 训练）已通过 `merge_and_unload()` bake 进 base model weights，不再是独立 adapter。不存在"某个 prompt 激活 ASR，另一个 prompt 激活 retrieval"——prompt 不切换 capability，weights 决定 capability。
+
+ASR 能力通过 speech token（音频输入）触发，我们的 input 里没有音频，ASR pathway 完全不走。换 instruction prompt 不会和 ASR 干扰。Stage-2 merge 的好处：更强的 multimodal 理解和 instruction-following，对 retrieval 有利，与 prompt 格式无关。
+
+### Prompt 设计与对结果的影响
+
+**Phase-A baseline（Plan-3）用的 prompt（生成任务）：**
+```
+"Given the reference fashion image and the modification instruction,
+write a concise caption describing the target fashion item after
+applying the modification."
+
+Modification: {mod_text}
+```
+那是让模型**生成文字 caption**，与 Plan-5 的用途不同。
+
+**Plan-5 embedding 任务的 prompt：**
+
+我们不 generate——只取 EOS position 的 last hidden state 作为 embedding。所以 prompt 的作用是"告诉模型 EOS token 应该 represent 什么"。
+
+**v1（最初的简单版本）：**
+```python
+content = [{"type": "image", "image": img}]
+content.append({"type": "text", "text": f"Modification: {txt}"})
+```
+问题：没有告诉模型任务是什么。EOS 可能只是"图像 + 文字的语义摘要"，而不是"应该找到的目标商品的表示"。
+
+**v2（当前版本，更明确的 instruction）：**
+```python
+content = [{"type": "image", "image": img}]
+content.append({"type": "text", "text": (
+    f"Given this product image, find the item that looks like the image "
+    f"but with the following modification: {txt}"
+    if txt else
+    "Describe the product shown in this image."
+)})
+```
+改进：明确告诉模型这是一个 retrieval 任务（"find the item"），EOS representation 更可能朝"目标商品是什么"的方向走。模型是 instruction-tuned 的，给了明确任务描述会更好地激活 instruction-following 能力。
+
+### 图像 grounding 风险
+
+图像 token 在序列前半部分，modification text 在后面。Causal attention 下 EOS 可以 attend 所有 token，但 LLM 倾向于偏重最近 context（text）。训练过程中模型可能越来越忽略图像。监控指标：`dev/r10_stripped`（无文字版 R@10）。如果它随训练趋近 0，说明模型已经不用图像了。
+
+### System prompt
+
+**现在没有显式 system prompt**。`messages_list` 只有 `role: user`，Qwen2-VL 的 chat template 遇到没有 system message 时会自动插入默认的：
+```
+You are a helpful assistant.
+```
+
+**为什么最初没有考虑改 system prompt？** System prompt 在 embedding 任务里是一个更进阶的优化，优先级低于 user instruction 本身。初版先把 user instruction 说清楚（v1 → v2 的改动），system prompt 是下一步可以考虑的地方。
+
+**System prompt 有没有用？** 有可能。把默认的 "You are a helpful assistant." 换成更明确的任务描述，例如：
+```
+You are a fashion product retrieval assistant. Given a product image and a modification description, your goal is to represent what the modified target item should look like.
+```
+这样模型的 EOS representation 从一开始就被 prime 成"retrieval 任务"而不是"general assistant 任务"。但这还没有验证过，是一个值得试的改动，改之前需要先跑完当前的 run 有个 baseline 数字做对比。
+
+## Q31: 为什么 eval 只在 GPU 0 上跑？一起跑不是更快吗？
+
+两个阶段会出现"GPU 0 独自工作"的现象：
+
+1. **模型加载时**（前 2 分钟）：rank 0 先加载模型再 broadcast，其他 GPU 等着。
+2. **每次 eval 时**：代码里 `if _should_eval() and accelerator.is_main_process` — eval 只在 rank 0 上跑。其他 7 个 GPU 跳过 eval block，立刻开始下一个 batch 的 forward+backward，到 AllReduce 时卡住等 rank 0 跑完 eval。所以 eval 期间 GPU 1–7 瞬间跑一步就变成 0% util，GPU 0 一直在跑 eval inference。
+
+正常 training step 期间（没有 eval）所有 8 个 GPU 应该都在工作。
+
+理论上完全可以分布式跑，而且确实会更快。现在只在 GPU 0 跑是因为代码里用了 `if accelerator.is_main_process` 这个最简单的写法，省掉了跨 GPU 通信。
+
+Eval 分两步：
+1. **推理**：把 1500 个 query 过一遍 7B VLM，得到 embedding
+2. **检索**：把 1500 个 embedding 和 59k gallery 做 cosine similarity，算 R@K
+
+步骤 2 必须在一个地方做（需要所有 embedding 在一起）。步骤 1 是可以并行的——1500 queries 分给 8 个 GPU，每个 GPU 只跑 188 个，快 8 倍，然后用 `all_gather` 把结果汇总到 rank 0 再算 metrics。
+
+现在的代价：
+- 每次 eval 约 6–8 分钟（1500 queries 在单 GPU 上串行推理）
+- 3 epochs 共 6 次 eval = ~40 分钟纯 eval 时间
+- 这期间 7 个 GPU 完全在空转
+
+分布式 eval 之后：
+- 每次 eval 约 1 分钟
+- 6 次 eval = ~6 分钟
+- 节省约 35 分钟
+
+值得在下个 run 改，代码改动约 30 行。
+
+## Q32: 为什么没有 validation loss？能不能在 validation set 上也算一个 loss？
+
+理论上可以，但对 retrieval 任务来说 R@K 比 validation loss 更有用，所以我们直接用 R@K 作为 validation 信号。
+
+### 为什么不用 validation loss
+
+**能算吗？** 可以。对 dev_slice 里的 500 个 triplet 算一遍 InfoNCE loss，就是 validation loss。
+
+**有用吗？** 有限。InfoNCE loss 衡量的是"在 ~255 个 in-batch negatives 里，model 能不能把 positive 排第一"。它告诉你模型有没有严重过拟合（val loss >> train loss），仅此而已。
+
+**R@K 更有用的原因：**
+1. R@K 衡量的是在完整的 59k gallery 里检索——这才是实际任务
+2. InfoNCE loss 低不代表 gallery retrieval 好，模型可能记住了 in-batch negative 的分布模式
+3. R@K 直接可读：R@10=0.154 = 15.4% 的 query 能在前10名里找到答案
+4. `sensitivity_gap`（normal - stripped R@10）能检测图像 grounding 是否崩溃，loss 完全看不出来
+
+### 结论
+
+我们每 0.5 epoch 跑一次的 dev eval（500 queries × 59k gallery）就是 validation——只是用 R@K 而不是 loss 来表达。这是 retrieval/contrastive learning 的标准做法（CLIP、BLIP、FashionCLIP 都这样）。
+
+没有"validation loss"是刻意的设计，不是遗漏。
