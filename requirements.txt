@@ -79,3 +79,6 @@ requests==2.32.3
 
 # --- Plan-5 contrastive training additions ---
 open_clip_torch
+
+# --- Plan-8 demo app (Gradio UI) ---
+gradio>=4.0
