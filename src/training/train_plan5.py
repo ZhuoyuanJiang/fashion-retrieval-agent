@@ -33,6 +33,7 @@ from src.training.loss import SymmetricInfoNCE
 from src.training.online_eval import (
     harness_sanity,
     make_gallery_db,
+    run_dev_loss,
     run_dev_probe,
     run_retrieval_eval,
 )
@@ -71,6 +72,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb-project", default="fashion-retrieval-agent")
     p.add_argument("--wandb-run-name", default=None)
     p.add_argument("--no-wandb", action="store_true")
+    p.add_argument("--lr-schedule", choices=["none", "cosine"], default="none",
+                   help="LR schedule: cosine decay over total steps, or none (constant). "
+                        "Default 'none' matches Plan-6; cosine harmed short-schedule runs (see Progress_7).")
     p.add_argument("--resume-from", type=Path, default=None,
                    help="ckpt_epochN/ dir to resume from (loads vlm_lora + proj_head.pt)")
     p.add_argument("--start-epoch", type=int, default=0,
@@ -319,6 +323,16 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
+    # LR scheduler (created after prepare so len(train_loader) is final)
+    # ------------------------------------------------------------------
+    _total_steps = len(train_loader) * args.max_epochs
+    if args.lr_schedule == "cosine":
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        scheduler = CosineAnnealingLR(optimizer, T_max=_total_steps, eta_min=0)
+    else:
+        scheduler = None
+
+    # ------------------------------------------------------------------
     # Resume from checkpoint (all ranks load; NAS path is shared)
     # ------------------------------------------------------------------
     if args.resume_from is not None:
@@ -336,6 +350,11 @@ def main() -> None:
                 torch.load(str(loss_fn_pt), map_location=accelerator.device)
             )
         accelerator.print(f"Resumed from checkpoint: {ckpt}")
+        # Fast-forward scheduler to match the resumed step
+        if scheduler is not None:
+            resume_steps = args.start_epoch * len(train_loader)
+            for _ in range(resume_steps):
+                scheduler.step()
 
     # ------------------------------------------------------------------
     # W&B init
@@ -410,6 +429,8 @@ def main() -> None:
                 ).item()
 
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
 
             # Clamp logit_scale after every step (all ranks — clamp modifies .data
             # directly, bypassing DDP sync, so every rank must clamp independently)
@@ -441,6 +462,18 @@ def main() -> None:
             # ----------------------------------------------------------
             if _should_eval(global_step) and accelerator.is_main_process:
                 unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_loss_fn = accelerator.unwrap_model(loss_fn)
+
+                # Dev InfoNCE loss (primary overfitting signal)
+                dev_loss = run_dev_loss(
+                    unwrapped_model,
+                    unwrapped_loss_fn,
+                    train_ds.dev_items,
+                    gallery_lookup,
+                    tid_to_idx,
+                    base_ds,
+                    device,
+                )
 
                 # Dev eval (500 queries, 3 conditions)
                 probe = run_dev_probe(
@@ -467,6 +500,7 @@ def main() -> None:
                 metric_row = {
                     "step": global_step,
                     "epoch_frac": global_step / steps_per_epoch,
+                    "dev/loss":           dev_loss,
                     "dev/r1_normal":      normal.recall[1],
                     "dev/r5_normal":      normal.recall[5],
                     "dev/r10_normal":     normal.recall[10],
@@ -489,6 +523,7 @@ def main() -> None:
                 )
                 accelerator.print(
                     f"\n[DEV @step {global_step}]\n"
+                    f"  dev/loss={dev_loss:.4f}\n"
                     + format_metrics_table(probe["normal"])
                     + f"\n  sensitivity gap (normal−stripped): {sensitivity_gap:+.4f}"
                     + f"\n=== Headline ===\n"

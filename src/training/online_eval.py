@@ -93,6 +93,56 @@ def run_dev_probe(
     }
 
 
+@torch.inference_mode()
+def run_dev_loss(
+    model: torch.nn.Module,
+    loss_fn: torch.nn.Module,
+    dev_items: list[dict],
+    gallery_lookup: dict[str, np.ndarray],
+    tid_to_idx: dict[str, int],
+    base_ds: "FacapDataset",
+    device: torch.device,
+    batch_size: int = 32,
+) -> float:
+    """Multi-positive InfoNCE on the full dev set. Primary overfitting signal.
+
+    Encodes all dev queries in batches, then computes loss over the full set
+    in one shot (no cross-GPU gather — single-process eval on a fixed held-out set).
+    Returns scalar loss value.
+    """
+    was_training = model.training
+    model.eval()
+
+    all_q: list[torch.Tensor] = []
+    all_t: list[torch.Tensor] = []
+    all_tids: list[torch.Tensor] = []
+
+    for i in range(0, len(dev_items), batch_size):
+        chunk = dev_items[i:i + batch_size]
+        images = [base_ds.load_image(it, "candidate") for it in chunk]
+        texts = [it["modification_text"] for it in chunk]
+        q_embs = model(images, texts).cpu().float()
+        t_embs = torch.stack(
+            [torch.from_numpy(gallery_lookup[it["target_id"]]) for it in chunk]
+        ).float()
+        tids = torch.tensor(
+            [tid_to_idx[it["target_id"]] for it in chunk], dtype=torch.int64
+        )
+        all_q.append(q_embs)
+        all_t.append(t_embs)
+        all_tids.append(tids)
+
+    q = torch.cat(all_q, dim=0).to(device)
+    t = torch.cat(all_t, dim=0).to(device)
+    tids_tensor = torch.cat(all_tids, dim=0).to(device)
+
+    loss = loss_fn(q, t, gather=False, target_ids=tids_tensor)
+
+    if was_training:
+        model.train()
+    return loss.item()
+
+
 def harness_sanity(
     gallery_db: CaptionDB,
     n_samples: int = 20,

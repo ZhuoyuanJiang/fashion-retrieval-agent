@@ -27,6 +27,10 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}}"
 export WANDB_DIR="${WANDB_DIR:-/ssd1/zhuoyuan/wandb_cache}"
 
+# Make `from src...` imports work when accelerate spawns workers (sys.path[0]
+# is the script dir, not repo root, so `src` is not importable without this)
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+
 CONDA_PYTHON="$(conda run -n fashion_retrieval which python 2>/dev/null || echo python)"
 CONDA_ACCEL="$(conda run -n fashion_retrieval which accelerate 2>/dev/null || echo accelerate)"
 
