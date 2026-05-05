@@ -1108,6 +1108,263 @@ reference (path or ID) and provide a helper to load on demand.
 
 ---
 
+## Q8.5: Why return both `candidate_image_path` and `candidate_id`? Why not just use the path as the key?
+
+**Context:** `FacapDataset.__getitem__` returns both raw FACap paths and
+derived IDs:
+
+```python
+{
+    "candidate_image_path": "f200k_images/dresses/12345678_0.jpeg",
+    "target_image_path": "f200k_images/dresses/87654321_0.jpeg",
+    "candidate_id": "12345678_0",
+    "target_id": "87654321_0",
+}
+```
+
+The IDs are derived from the paths. They are not extra labels and not extra
+supervision.
+
+### The design question from scratch
+
+Start with what FACap gives us:
+
+```text
+candidate_image_path
+target_image_path
+modification_text
+target_caption
+```
+
+If the only goal were to inspect one row, this would be enough. But the
+retrieval pipeline also needs to answer operational questions:
+
+- Which reference image produced this generated caption?
+- Which target image is the ground-truth answer?
+- Did the ranked retrieval list contain the true target?
+- Which image does row `i` of the caption DB or image cache refer to?
+- Did train and eval share the same image?
+
+Those questions are easier to answer with a normalized image key.
+
+### Path vs. ID
+
+The raw path answers provenance:
+
+```text
+Where did FACap say this image came from?
+```
+
+The ID answers identity:
+
+```text
+Which image is this, independent of how this local copy is stored?
+```
+
+So:
+
+```text
+candidate_image_path = provenance / original FACap metadata
+candidate_id         = operational image key
+```
+
+The path could be used as the key if the whole system committed to raw path
+strings everywhere. I chose not to make path strings the central key because
+paths mix two concepts:
+
+```text
+identity:       12345678_0
+storage/layout: f200k_images/dresses/...jpeg
+```
+
+If the storage layout, directory prefix, or extension changes, the path string
+can change while the image identity remains the same.
+
+### Concrete qualitative example
+
+Retrieval/evaluation naturally wants records like:
+
+```json
+{
+  "query_id": "12345678_0",
+  "true_target": "87654321_0",
+  "top10_predicted": ["11111111_0", "87654321_0", "22222222_0"],
+  "rank": 2
+}
+```
+
+This says:
+
+```text
+reference image = 12345678_0
+correct target  = 87654321_0
+retrieved rank  = 2
+```
+
+The same record could be written with full paths, but it is longer and ties
+the result artifact to one path convention:
+
+```json
+{
+  "query_path": "f200k_images/dresses/12345678_0.jpeg",
+  "true_target_path": "f200k_images/dresses/87654321_0.jpeg"
+}
+```
+
+IDs make logs, cache metadata, retrieval outputs, and split filters speak the
+same compact naming language.
+
+### Why `target_id` is obvious
+
+`target_id` is the answer key for retrieval:
+
+```python
+rank = rank_of(item["target_id"], q_emb, db)
+```
+
+The caption DB and image target cache both need row metadata:
+
+```text
+embedding row i -> target_id
+```
+
+So evaluation can compare:
+
+```text
+retrieved target_id == true target_id
+```
+
+### Why `candidate_id` is also useful
+
+`candidate_id` identifies the **query/reference image**, not the answer.
+It is useful for:
+
+1. **Qualitative debugging**
+
+   If a query fails, we need to know which reference image produced that
+   generated caption and retrieval result. The qualitative dump records it as
+   `query_id`.
+
+2. **Image loading / cache lookup**
+
+   The local image cache can be organized however we want. In the current
+   setup it is keyed by filename stem, so loading the candidate image is:
+
+   ```python
+   image_id = item["candidate_id"]
+   path = image_cache_root / f"{image_id}.jpeg"
+   ```
+
+   The point is not that this is the only possible cache layout. The point is
+   that downstream code can use a normalized key instead of depending on raw
+   FACap path strings.
+
+3. **Train/eval image-level filtering**
+
+   For contrastive training, it is not enough to exclude eval target images.
+   If an eval reference image appears elsewhere in training as a target, the
+   model has still seen that eval image. Clean filtering uses both:
+
+   ```text
+   eval candidate IDs + eval target IDs
+   ```
+
+### Final rationale
+
+`candidate_id` and `target_id` are convenience fields derived from the raw
+paths. They are not required by the math, but they make the system cleaner:
+
+- path fields preserve dataset provenance
+- ID fields provide compact operational keys
+- downstream code does not repeatedly parse path strings
+- retrieval DB rows, qualitative logs, image cache lookup, and split filtering
+  use the same image identity convention
+
+### Plain-language version from the discussion
+
+我们存 ID 的核心原因是：不要把“图片是谁”绑定到“图片在某个文件系统 / 数据集
+manifest 里怎么写”。
+
+从零开始设计可以这样推：
+
+1. FACap 给我们的原始信息是：
+
+   ```text
+   candidate_image_path = "f200k_images/dresses/12345678_0.jpeg"
+   target_image_path    = "f200k_images/dresses/87654321_0.jpeg"
+   modification_text    = "make it floral and sleeveless"
+   target_caption       = "A sleeveless floral dress ..."
+   ```
+
+   如果只是读数据，这四个字段够了。
+
+2. 但 retrieval 系统需要判断“哪张图是哪张图”：
+
+   ```text
+   eval: retrieved image == true target?
+   cache lookup: this embedding row belongs to which image?
+   qualitative dump: this query/reference image is which image?
+   split filtering: train and eval share the same image?
+   ```
+
+   这些操作需要一个 image key。
+
+3. 可以直接用 path 当 key，但 path 混合了 identity 和 location：
+
+   ```text
+   f200k_images/dresses/12345678_0.jpeg
+   ```
+
+   里面有两种信息：
+
+   ```text
+   identity: 12345678_0
+   dataset/layout: f200k_images/dresses/...jpeg
+   ```
+
+   如果以后图片位置、目录结构、extension、cache layout 变了，path string 会变，
+   但图片 identity 没变。所以 path 不是不能当 key，而是它把 identity 和
+   storage layout 绑在一起了。
+
+4. 所以我们 normalize 出 image ID：
+
+   ```text
+   candidate_id = "12345678_0"
+   target_id    = "87654321_0"
+   ```
+
+   这两个 ID 是从 path 里 derived 出来的，不是额外 label，不是新的 supervision。
+
+5. 为什么 candidate 也要 ID，不只是 target 要 ID：
+
+   `target_id` 很直观：判断 retrieve 对没对。
+
+   `candidate_id` 是 query/reference image 的 identity。它用于：
+
+   ```text
+   1. 记录这条 query 是哪张 reference image
+   2. 从 image cache 找 reference image
+   3. qualitative dump/debug/demo 里显示 query_id
+   4. train/eval split filtering：避免 eval candidate image 在 train 里出现
+   ```
+
+   尤其是第 4 点：如果 eval 里的 candidate image 在 train 里作为 target 出现过，
+   也算 image-level leakage。所以 clean split 需要同时看：
+
+   ```text
+   candidate_id
+   target_id
+   ```
+
+Meeting wording:
+
+> We keep both the raw FACap path and a normalized image ID. The path preserves
+> provenance; the ID is the operational key. Retrieval/evaluation is naturally
+> phrased as "reference image ID plus modification retrieves a ranked list of
+> target image IDs." The ID is derived from the path, not extra supervision.
+
+---
+
 ## Q9: What's the actual query Qwen2VL gets, and what query strategies were considered?
 
 **Context:** The real VLM backends (`Qwen2VLCaptioner`,
