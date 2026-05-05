@@ -48,6 +48,45 @@
 #   `annotate()` in the last section).
 
 # %% [markdown]
+# ## Pipeline recap — what produced the numbers in this notebook
+#
+# This notebook reads the `runs/baseline_v1_speechqwen2vl/` run, whose
+# pipeline is:
+#
+# | Component | Choice |
+# |---|---|
+# | **VLM** (caption generator) | `speechqwen2vl` |
+# | **Text encoder** (gallery + query embedding) | `sentence-transformers/all-MiniLM-L6-v2` (22 M params, 384-dim — the **weakest anchor** from the Plan 3 M4 encoder zoo) |
+# | **Gallery** | All 59,082 dress captions from FACap (`dress_train_captions.json`) |
+# | **Eval queries** | 1000 dress triplets from FACap (`dress_train_triplets.json`) |
+#
+# **End-to-end retrieval, per query:**
+#
+# 1. `(reference image, modification text)` → `speechqwen2vl` → `generated_caption` (1 string, median ≈ 92 chars)
+# 2. `MiniLM-L6.encode(generated_caption)` → `query_emb` ∈ ℝ³⁸⁴
+# 3. (built once, reused) `MiniLM-L6.encode(every dress caption)` → `gallery_embs` ∈ ℝ^{59082 × 384}
+# 4. cosine similarity → 59,082 scores → sort → find the true target's position → `rank`
+# 5. Aggregate: `R@K = #{rank ≤ K} / 1000`
+#
+# So **R@1 = 84 / 1000 = 0.084**, **R@10 = 240 / 1000 = 0.240**.
+#
+# **Two properties to keep in mind:**
+#
+# - **Text-only after step 1.** Steps 2–5 never see a pixel. Failure
+#   modes split cleanly into *VLM-side* (caption is bad) vs
+#   *encoder-side* (caption is fine but text→embedding mapping fails).
+# - **Captions are encoder-independent.** The 1000 captions are written
+#   by the VLM once and saved; swapping the encoder (e.g. to Marqo
+#   FashionCLIP, R@1 = 0.258) only re-runs steps 2–4. So the
+#   caption-quality findings in this notebook (length gap, token
+#   overlap, etc.) transfer verbatim to any other encoder run.
+#
+# Why MiniLM-L6 specifically (not the strongest encoder)? It's the
+# Plan 3 baseline anchor and has more failure samples to characterize
+# (rank ≥ 201: 472 of 1000 vs ~250 with Marqo). To re-analyze a
+# different encoder run, change `RUN_DIR` in cell 2 below.
+
+# %% [markdown]
 # ## 1. Imports + paths
 #
 # Change `RUN_DIR` to point at any other run directory (e.g.
