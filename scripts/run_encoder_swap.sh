@@ -11,6 +11,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 SOURCE_RUN="${SOURCE_RUN:-runs/baseline_v1_speechqwen2vl}"
+# Output run prefix derived from SOURCE_RUN basename. Override via RUN_PREFIX.
+# E.g. SOURCE_RUN=runs/baseline_v2_speechqwen2vl_20260504
+#   -> RUN_PREFIX=baseline_v2_speechqwen2vl_20260504
+#   -> per-encoder runs land at runs/baseline_v2_speechqwen2vl_20260504_<slug>/
+RUN_PREFIX="${RUN_PREFIX:-$(basename "$SOURCE_RUN")}"
 LOG_DIR="$REPO_ROOT/logs"
 mkdir -p "$LOG_DIR"
 
@@ -48,9 +53,10 @@ source /home/zhuoyuan/miniconda3/etc/profile.d/conda.sh
 conda activate fashion_retrieval
 
 echo "=== encoder swap orchestrator ==="
-echo "  source run : $SOURCE_RUN"
-echo "  log dir    : $LOG_DIR"
-echo "  encoders   : ${#SLUGS[@]}"
+echo "  source run  : $SOURCE_RUN"
+echo "  run prefix  : $RUN_PREFIX (per-encoder runs at runs/${RUN_PREFIX}_<slug>/)"
+echo "  log dir     : $LOG_DIR"
+echo "  encoders    : ${#SLUGS[@]}"
 echo ""
 
 # Files we'll touch for status tracking.
@@ -63,7 +69,7 @@ declare -A PIDS
 for slug in "${SLUGS[@]}"; do
     gpu="${GPU[$slug]:-0}"
     log="$LOG_DIR/encoder_swap_${slug}.log"
-    run_name="baseline_v1_speechqwen2vl_${slug}"
+    run_name="${RUN_PREFIX}_${slug}"
 
     # Skip already-completed runs (so re-running is idempotent).
     if [ -f "runs/${run_name}/metrics.json" ]; then

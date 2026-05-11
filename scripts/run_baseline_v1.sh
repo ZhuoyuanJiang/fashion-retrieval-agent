@@ -40,6 +40,8 @@
 #                Unset (default) = full DB encoding all ~59k captions, shared
 #                across runs and reused across n_eval changes.
 #   SEED         subset mode only: seed for distractor sampling (default: 42)
+#   PROMPT_VARIANT  Plan 9: VLM prompt template — `concise` (default, original
+#                   v1 prompt) or `detailed` (longer multi-attribute output)
 # =============================================================================
 
 set -e  # exit on any error
@@ -53,6 +55,7 @@ VLM="${VLM:-speechqwen2vl}"
 RUN_NAME="${RUN_NAME:-baseline_v1_${VLM}}"
 DB_SIZE="${DB_SIZE:-}"      # empty = full mode (default), int = subset mode
 SEED="${SEED:-42}"
+PROMPT_VARIANT="${PROMPT_VARIANT:-concise}"
 
 if [ -z "$DB_SIZE" ]; then
     DB_MODE_DESC="full (all captions, shared at runs/caption_db/<enc>/)"
@@ -61,11 +64,12 @@ else
 fi
 
 echo "=== baseline run config ==="
-echo "  vlm        : $VLM"
-echo "  n_eval     : $N_EVAL"
-echo "  run_name   : $RUN_NAME"
-echo "  db_mode    : $DB_MODE_DESC"
-echo "  HF_HOME    : ${HF_HOME:-default (~/.cache/huggingface)}"
+echo "  vlm           : $VLM"
+echo "  n_eval        : $N_EVAL"
+echo "  run_name      : $RUN_NAME"
+echo "  db_mode       : $DB_MODE_DESC"
+echo "  prompt_variant: $PROMPT_VARIANT"
+echo "  HF_HOME       : ${HF_HOME:-default (~/.cache/huggingface)}"
 echo ""
 
 # ---------- env sanity ----------
@@ -88,6 +92,7 @@ RUN_BASELINE_ARGS=(
     --vlm "$VLM"
     --n-eval "$N_EVAL"
     --run-name "$RUN_NAME"
+    --prompt-variant "$PROMPT_VARIANT"
 )
 if [ -n "$DB_SIZE" ]; then
     RUN_BASELINE_ARGS+=(--db-size "$DB_SIZE" --seed "$SEED")

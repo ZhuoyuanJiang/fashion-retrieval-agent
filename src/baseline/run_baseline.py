@@ -167,6 +167,7 @@ def run(
     *,
     db_size: int | None = None,
     seed: int = 42,
+    prompt_variant: str = "concise",
 ) -> None:
     # 1. Dataset + eval slice (last n_eval triplets)
     ds = FacapDataset(category=category, split=split)
@@ -197,7 +198,9 @@ def run(
           f"{eval_targets_in_db}/{n_eval} eval targets present in DB")
 
     # 3. VLM captioner
-    captioner = make_captioner(vlm, image_cache_root=image_cache)
+    captioner = make_captioner(
+        vlm, image_cache_root=image_cache, prompt_variant=prompt_variant,
+    )
 
     # 4. Text encoder for the query side
     encoder = TextEncoder(model_name=encoder_name)
@@ -237,6 +240,7 @@ def run(
         "category": category,
         "split": split,
         "encoder": encoder_name,
+        "prompt_variant": prompt_variant,
         "db_path": str(db_dir),
         "db_mode": "full" if db_size is None else "subset",
         "facap_commit_sha": db.config.get("facap_commit_sha"),
@@ -261,6 +265,10 @@ def main() -> None:
                              "(default: full DB encoding all captions)")
     parser.add_argument("--seed", type=int, default=42,
                         help="subset mode only: seed for distractor sampling")
+    parser.add_argument("--prompt-variant", default="concise",
+                        choices=["concise", "detailed"],
+                        help="VLM prompt template (Plan 9: detailed asks for "
+                             "longer multi-attribute captions)")
     args = parser.parse_args()
     run(
         vlm=args.vlm,
@@ -273,6 +281,7 @@ def main() -> None:
         image_cache=Path(args.image_cache),
         db_size=args.db_size,
         seed=args.seed,
+        prompt_variant=args.prompt_variant,
     )
 
 

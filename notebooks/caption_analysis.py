@@ -117,7 +117,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.data.facap_dataset import FacapDataset, _path_to_image_id  # noqa: E402
 
 # ---- config: change RUN_DIR to analyze a different run ----
-RUN_DIR = REPO_ROOT / "runs" / "baseline_v1_speechqwen2vl"
+RUN_DIR = REPO_ROOT / "runs" / "baseline_v2_speechqwen2vl_20260504"
 RESULTS = RUN_DIR / "qualitative" / "results.jsonl"
 METRICS = RUN_DIR / "metrics.json"
 ANNOTATIONS = RUN_DIR / "annotations.jsonl"  # opt-in; only created if you call annotate()

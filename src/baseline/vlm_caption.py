@@ -20,9 +20,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from PIL import Image
+
+PromptVariant = Literal["concise", "detailed"]
 
 # Both real backends need >= this many GB of total VRAM to run Qwen2-VL-7B at bf16.
 MIN_VRAM_GB_FOR_QWEN2VL_7B = 14.0
@@ -128,11 +130,22 @@ class OracleCaptioner(VLMCaptioner):
 class _Qwen2VLLikeCaptioner(VLMCaptioner):
     """Shared logic for vanilla Qwen2-VL and speechQwen2VL (text-only mode)."""
 
-    PROMPT_TEMPLATE = (
+    PROMPT_TEMPLATE_CONCISE = (
         "Given the reference fashion image and the modification instruction, "
         "write a concise caption describing the target fashion item after "
         "applying the modification."
     )
+    PROMPT_TEMPLATE_DETAILED = (
+        "Given the reference fashion image and the modification instruction, "
+        "write a detailed caption describing the target fashion item after "
+        "applying the modification. For example, you could consider aspects "
+        "like silhouette, neckline, sleeves, fabric, color, pattern, or "
+        "distinctive details."
+    )
+    PROMPT_TEMPLATES: dict[PromptVariant, str] = {
+        "concise": PROMPT_TEMPLATE_CONCISE,
+        "detailed": PROMPT_TEMPLATE_DETAILED,
+    }
     GENERATION_KWARGS = {
         "max_new_tokens": 256,
         "num_beams": 1,
@@ -144,9 +157,20 @@ class _Qwen2VLLikeCaptioner(VLMCaptioner):
     BASE_REPO: str = ""
     LORA_REPO: str | None = None
 
-    def __init__(self, image_cache_root: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        image_cache_root: Path | str | None = None,
+        prompt_variant: PromptVariant = "concise",
+    ) -> None:
         _check_can_host_qwen2vl_7b(self.MODEL_LABEL)
         self.image_cache_root = Path(image_cache_root) if image_cache_root else None
+        if prompt_variant not in self.PROMPT_TEMPLATES:
+            raise ValueError(
+                f"unknown prompt_variant={prompt_variant!r}; "
+                f"known: {sorted(self.PROMPT_TEMPLATES)}"
+            )
+        self.prompt_variant: PromptVariant = prompt_variant
+        self.PROMPT_TEMPLATE = self.PROMPT_TEMPLATES[prompt_variant]
         self._load_model()
 
     def _load_model(self) -> None:
