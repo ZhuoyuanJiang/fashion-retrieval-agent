@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
-# Plan-10 V1 (Option B) launcher: Qwen2VL/Qwen2VL two-tower contrastive training.
+# Plan-10 V1 launcher: Qwen2VL/Qwen2VL two-tower contrastive training.
+#
+# Supports both architecture variants from Plan_10 §4.3:
+#   --arch separate  (default — Option B: two independent ContrastiveQwen2VL towers)
+#   --arch shared    (Option A: one shared Qwen2VL backbone + two PEFT LoRA adapters;
+#                     gradient checkpointing OFF — see Progress_11)
 #
 # Differences vs run_plan5.sh:
 #   - No target cache build step. The target tower is trainable, so the gallery
 #     is encoded dynamically inside train_plan10.py (startup + end-of-epoch).
-#   - Defaults are tuned for Option B (two backbones, ~30 GB resident): bs=8,
-#     8 GPUs, gather=ON.
+#   - Defaults tuned for Option B (two backbones, ~36 GB resident): bs=8,
+#     8 GPUs, gather=ON. Option A no-checkpoint has comparable VRAM at bs=8 and
+#     comfortable headroom to scale up (see Progress_11 §Appendix C).
 #   - Default --run-dir lives under runs_local_plan10/ (server10-local;
 #     the runs/ symlink only resolves on server6).
 #
 # Usage:
-#   bash scripts/run_plan10.sh                # 8-GPU launch, bs=8, gather=ON
-#   bash scripts/run_plan10.sh --batch-size 6 # smaller batch
+#   bash scripts/run_plan10.sh                          # Option B, 8 GPU, bs=8
+#   bash scripts/run_plan10.sh --arch shared            # Option A, 8 GPU, bs=8
+#   bash scripts/run_plan10.sh --batch-size 12          # smaller / bigger batch
 #   bash scripts/run_plan10.sh --first-eval-step 5 [other flags...]
 #
 # All unrecognized args are forwarded to train_plan10.py.
@@ -78,6 +85,6 @@ else
     )
 fi
 
-echo "=== Starting Plan-10 V1 (Option B) training: ${RUN_DIR} ==="
+echo "=== Starting Plan-10 V1 training: ${RUN_DIR} ==="
 echo "    cmd: ${TRAIN_CMD[*]}"
 "${TRAIN_CMD[@]}"

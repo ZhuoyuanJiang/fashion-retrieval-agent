@@ -47,7 +47,11 @@ from accelerate.utils import DistributedDataParallelKwargs, set_seed
 
 from src.data.contrastive_dataset import FacapContrastiveDataset, contrastive_collate
 from src.data.facap_dataset import FacapDataset
-from src.training.two_tower_model import TwoTowerSeparateBackbones, TARGET_PROMPT
+from src.training.two_tower_model import (
+    TwoTowerSeparateBackbones,
+    TwoTowerSharedBackbone,
+    TARGET_PROMPT,
+)
 from src.training.loss import SymmetricInfoNCE
 from src.training.online_eval import (
     encode_gallery_with_tower,
@@ -65,7 +69,13 @@ from src.baseline.eval import format_metrics_table
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Plan-10 V1 (Option B) two-tower training")
+    p = argparse.ArgumentParser(description="Plan-10 V1 two-tower training")
+    p.add_argument("--arch", choices=["separate", "shared"], default="separate",
+                   help="Two-tower architecture variant. 'separate' = Option B "
+                        "(two independent ContrastiveQwen2VL towers, default for "
+                        "back-compat). 'shared' = Option A (one shared backbone + "
+                        "two PEFT LoRA adapters; gradient checkpointing OFF — see "
+                        "Progress_11 §Appendix C).")
     p.add_argument("--run-dir", type=Path,
                    default=Path("runs_local_plan10/run_default"),
                    help="Output directory. On server10 use runs_local_plan10/, "
@@ -254,10 +264,16 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Model + loss
     # ------------------------------------------------------------------
-    model = TwoTowerSeparateBackbones(
-        d_target=args.d_target,
-        device_map=f"cuda:{accelerator.local_process_index}",
-    )
+    if args.arch == "shared":
+        model = TwoTowerSharedBackbone(
+            d_target=args.d_target,
+            device_map=f"cuda:{accelerator.local_process_index}",
+        )
+    else:  # "separate" (default — Option B)
+        model = TwoTowerSeparateBackbones(
+            d_target=args.d_target,
+            device_map=f"cuda:{accelerator.local_process_index}",
+        )
     loss_fn = SymmetricInfoNCE()
     device = accelerator.device
 
@@ -342,8 +358,10 @@ def main() -> None:
                     return label
             return "gpu"
         date_str = time.strftime("%Y%m%d")
+        arch_label = "shared" if args.arch == "shared" else "separate"
+        option_tag = "option-a" if args.arch == "shared" else "option-b"
         run_name = args.wandb_run_name or (
-            f"plan10/v1_separate_bs{args.batch_size}"
+            f"plan10/v1_{arch_label}_bs{args.batch_size}"
             f"_{accelerator.num_processes}x{_gpu_class()}_{date_str}"
         )
         accelerator.init_trackers(
@@ -351,7 +369,7 @@ def main() -> None:
             config=vars(args),
             init_kwargs={"wandb": {
                 "name": run_name,
-                "tags": ["phase-b", "plan10", "two-tower", "option-b"],
+                "tags": ["phase-b", "plan10", "two-tower", option_tag],
             }},
         )
 
@@ -549,13 +567,30 @@ def main() -> None:
         if accelerator.is_main_process:
             ckpt_dir = args.run_dir / f"ckpt_epoch{epoch + 1}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-            for tower_name in ("query_tower", "target_tower"):
-                tower = getattr(unwrapped_model, tower_name)
-                tower.vlm.save_pretrained(str(ckpt_dir / tower_name))
-                torch.save(
-                    tower.proj.state_dict(),
-                    ckpt_dir / f"head_{tower_name.split('_')[0]}.pt",
+            if args.arch == "shared":
+                # Option A: one PeftModel with two adapters under
+                # unwrapped_model.vlm; save_pretrained dumps BOTH adapters
+                # into subdirs adapter_name/ inside the destination.
+                unwrapped_model.vlm.save_pretrained(
+                    str(ckpt_dir / "shared_backbone")
                 )
+                torch.save(
+                    unwrapped_model.head_query.state_dict(),
+                    ckpt_dir / "head_query.pt",
+                )
+                torch.save(
+                    unwrapped_model.head_target.state_dict(),
+                    ckpt_dir / "head_target.pt",
+                )
+            else:
+                # Option B: two ContrastiveQwen2VL instances as attributes.
+                for tower_name in ("query_tower", "target_tower"):
+                    tower = getattr(unwrapped_model, tower_name)
+                    tower.vlm.save_pretrained(str(ckpt_dir / tower_name))
+                    torch.save(
+                        tower.proj.state_dict(),
+                        ckpt_dir / f"head_{tower_name.split('_')[0]}.pt",
+                    )
             torch.save(
                 accelerator.unwrap_model(loss_fn).state_dict(),
                 ckpt_dir / "logit_scale.pt",
