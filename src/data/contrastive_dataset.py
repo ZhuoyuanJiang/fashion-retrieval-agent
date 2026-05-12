@@ -28,12 +28,19 @@ DEV_SLICE_SIZE = 500        # carved from post-L2 pool for online dev eval
 
 
 class FacapContrastiveDataset(Dataset):
-    """Training triplets for Plan-5 contrastive fine-tuning.
+    """Training triplets for Plan-5 / Plan-10 contrastive fine-tuning.
 
     __getitem__ returns a dict:
         cand_image:  PIL.Image   candidate (reference) image
         mod_text:    str         modification instruction
         target_id:   str         ID of the correct target image
+        tgt_image:   PIL.Image   target image  (Plan-10 only; loaded when
+                                  `load_target=True`. Plan-5/6/7 ignore.)
+
+    Plan-5/6/7 callers leave `load_target=False` (default) — they look up
+    target embeddings from a precomputed FashionCLIP cache by `target_id`.
+    Plan-10 sets `load_target=True` so the target tower can encode the
+    target image on the fly each batch.
 
     Attributes:
         dev_items:      list[dict]  FacapDataset item dicts for the dev slice
@@ -47,9 +54,11 @@ class FacapContrastiveDataset(Dataset):
         base: FacapDataset,
         dev_seed: int = 42,
         dev_slice_json: Path | str | None = None,
+        load_target: bool = False,
     ) -> None:
         self.base = base
         self.dev_seed = dev_seed
+        self.load_target = load_target
 
         N = len(base)
         if N <= HEADLINE_SLICE_SIZE + DEV_SLICE_SIZE:
@@ -132,11 +141,14 @@ class FacapContrastiveDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         item = self.base[self._train_indices[idx]]
         cand_image = self.base.load_image(item, "candidate")
-        return {
+        out: dict[str, Any] = {
             "cand_image": cand_image,
             "mod_text": item["modification_text"],
             "target_id": item["target_id"],
         }
+        if self.load_target:
+            out["tgt_image"] = self.base.load_image(item, "target")
+        return out
 
     def summary(self) -> str:
         n_excl = len(self.exclusion_ids)
@@ -152,9 +164,14 @@ def contrastive_collate(batch: list[dict]) -> dict:
     """DataLoader collate that keeps PIL images as a list (not a stacked tensor).
 
     The VLM processor handles batching of PIL images — don't pre-stack them.
+    If items have `tgt_image` (Plan-10 mode), it's collated into `tgt_images`;
+    otherwise the key is absent and Plan-5/6/7 callers won't trip on it.
     """
-    return {
+    out = {
         "cand_images": [item["cand_image"] for item in batch],
         "mod_texts": [item["mod_text"] for item in batch],
         "target_ids": [item["target_id"] for item in batch],
     }
+    if "tgt_image" in batch[0]:
+        out["tgt_images"] = [item["tgt_image"] for item in batch]
+    return out

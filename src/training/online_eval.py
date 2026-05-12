@@ -1,14 +1,23 @@
-"""Online eval for Plan-5 contrastive training.
+"""Online eval for Plan-5 / Plan-10 contrastive training.
 
 Provides:
-  run_retrieval_eval  — evaluate a list of items against the image gallery
-  run_dev_probe       — 3-way sensitivity probe (normal / stripped / shuffled)
-  harness_sanity      — Verification #4: same image as query and gallery → R@1 ≈ 1.0
+  run_retrieval_eval         — evaluate items against the image gallery
+  run_dev_probe              — 3-way sensitivity probe (normal/stripped/shuffled)
+  run_dev_loss               — multi-positive InfoNCE on dev (Plan-5 path: uses gallery_lookup)
+  run_dev_loss_two_tower     — same, but encodes targets on the fly (Plan-10 path)
+  encode_gallery_with_tower  — Plan-10 distributed gallery encoder; pad/gather/sort/truncate
+  harness_sanity             — Verification: same image as query and gallery → R@1 ≈ 1.0
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import math
+from pathlib import Path
+
 import numpy as np
 import torch
+from PIL import Image
 from PIL import Image as PILImage
 
 from src.baseline.eval import EvalResult, compute_metrics
@@ -52,7 +61,10 @@ def run_retrieval_eval(
         else:
             texts = [it["modification_text"] for it in chunk]
 
-        q_embs = model(images, texts).cpu().float().numpy()  # (B, D)
+        # Both ContrastiveQwen2VL and TwoTowerSeparateBackbones expose
+        # encode_query(images, texts); for Plan-5/6/7 it's equivalent to
+        # model(images, texts), for Plan-10 it routes to query_tower only.
+        q_embs = model.encode_query(images, texts).cpu().float().numpy()  # (B, D)
         for j, it in enumerate(chunk):
             ranks.append(rank_of(it["target_id"], q_embs[j], gallery_db))
 
@@ -178,3 +190,178 @@ def harness_sanity(
         f"{'PASS' if passed else 'FAIL (check top_k / rank_of plumbing)'}"
     )
     return passed
+
+
+# =====================================================================
+# Plan-10 V1: two-tower helpers (target tower is trainable, no cache)
+# =====================================================================
+
+@torch.inference_mode()
+def run_dev_loss_two_tower(
+    model: torch.nn.Module,
+    loss_fn: torch.nn.Module,
+    dev_items: list[dict],
+    tid_to_idx: dict[str, int],
+    base_ds: FacapDataset,
+    device: torch.device,
+    batch_size: int = 32,
+) -> float:
+    """Plan-10 multi-positive InfoNCE on the full dev set.
+
+    Mirrors `run_dev_loss` but encodes target embeddings on the fly via
+    the model's trainable `encode_target(images)` helper (instead of
+    looking them up in a precomputed gallery_lookup dict — Plan-5/6/7
+    pattern that's no longer correct when the target tower is being
+    trained).
+
+    `model` must be the UNWRAPPED two-tower module
+    (`accelerator.unwrap_model(prepared_model)`); it must expose
+    `encode_query(images, texts)` and `encode_target(images)`.
+
+    Single-process eval (no cross-GPU gather). Returns scalar loss.
+    """
+    was_training = model.training
+    model.eval()
+
+    all_q: list[torch.Tensor] = []
+    all_t: list[torch.Tensor] = []
+    all_tids: list[torch.Tensor] = []
+
+    for i in range(0, len(dev_items), batch_size):
+        chunk = dev_items[i:i + batch_size]
+        cand_images = [base_ds.load_image(it, "candidate") for it in chunk]
+        tgt_images = [base_ds.load_image(it, "target") for it in chunk]
+        texts = [it["modification_text"] for it in chunk]
+
+        q_embs = model.encode_query(cand_images, texts).cpu().float()
+        t_embs = model.encode_target(tgt_images).cpu().float()
+        tids = torch.tensor(
+            [tid_to_idx[it["target_id"]] for it in chunk], dtype=torch.int64
+        )
+        all_q.append(q_embs)
+        all_t.append(t_embs)
+        all_tids.append(tids)
+
+    q = torch.cat(all_q, dim=0).to(device)
+    t = torch.cat(all_t, dim=0).to(device)
+    tids_tensor = torch.cat(all_tids, dim=0).to(device)
+
+    loss = loss_fn(q, t, gather=False, target_ids=tids_tensor)
+
+    if was_training:
+        model.train()
+    return loss.item()
+
+
+def _ids_hash_local(gallery_ids: list[str]) -> str:
+    """Mirror of target_cache._ids_hash for self-consistency checks."""
+    h = hashlib.md5()
+    for gid in gallery_ids:
+        h.update(gid.encode())
+    return h.hexdigest()[:12]
+
+
+@torch.inference_mode()
+def encode_gallery_with_tower(
+    model: torch.nn.Module,
+    gallery_ids: list[str],
+    gallery_paths: list[Path],
+    batch_size: int,
+    accelerator,
+    out_dir: Path | None = None,
+    epoch_tag: str | int = 0,
+) -> np.ndarray:
+    """Plan-10 distributed gallery encoder.
+
+    Encodes the full gallery through the target tower across all ranks.
+    Pads to ceil(N/world) so `accelerator.gather` works (N=59,082 is
+    not divisible by 8). Gathers paired (embedding, original_index)
+    tensors, re-sorts by index, truncates the padding rows.
+
+    Must be called from ALL ranks (do NOT gate on `is_main_process`).
+
+    Args:
+      model: UNWRAPPED two-tower module, must expose
+        `encode_target(images) -> (B, D)`.
+      gallery_ids, gallery_paths: lists of length N in canonical row
+        order. Use `src/training/target_cache._gallery_ids_and_paths`
+        to build them.
+      batch_size: per-rank chunk size for target_tower forward.
+      accelerator: the Accelerator object (for gather + sync).
+      out_dir: if given, rank 0 writes
+        `<out_dir>/gallery_emb_epoch<epoch_tag>.{npy,meta.json}`.
+      epoch_tag: tag stamped into the cache filename.
+
+    Returns:
+      full: (N, D) float32 L2-normalized — same on every rank.
+    """
+    was_training = model.training
+    model.eval()
+
+    rank = accelerator.process_index
+    world = accelerator.num_processes
+    N = len(gallery_ids)
+    assert len(gallery_paths) == N, (
+        f"gallery_ids ({N}) / gallery_paths ({len(gallery_paths)}) mismatch"
+    )
+
+    # Pad gallery to ceil(N/world)*world so every rank's shard has the
+    # SAME length — required by accelerator.gather. Padding entries
+    # duplicate the last item; they're truncated after the gather.
+    pad_to = math.ceil(N / world) * world
+    pad = pad_to - N
+    padded_ids = gallery_ids + ([gallery_ids[-1]] * pad)
+    padded_paths = gallery_paths + ([gallery_paths[-1]] * pad)
+
+    my_idx = list(range(rank, pad_to, world))            # equal length per rank
+    my_paths = [padded_paths[i] for i in my_idx]
+    my_orig_idx = torch.tensor(my_idx, dtype=torch.long, device=accelerator.device)
+
+    my_embs: list[torch.Tensor] = []
+    for c in range(0, len(my_paths), batch_size):
+        chunk_paths = my_paths[c:c + batch_size]
+        imgs = [Image.open(p).convert("RGB") for p in chunk_paths]
+        embs = model.encode_target(imgs)                  # (b, D), L2-normalized fp32
+        my_embs.append(embs.to(accelerator.device).float())
+    my_embs_t = torch.cat(my_embs, dim=0)                  # (pad_to/world, D)
+
+    # Gather paired (embeddings, original index) across ranks.
+    all_embs = accelerator.gather(my_embs_t)               # (pad_to, D)
+    all_idx = accelerator.gather(my_orig_idx)              # (pad_to,)
+
+    # Re-sort to canonical order; padding indices were valid positions
+    # but pointed at duplicated rows, so after argsort we just take the
+    # first N rows (positions [0, N)). Padding rows occupy positions
+    # [N, pad_to) but their ids are valid (last id reused) — argsort is
+    # not unique on duplicate ids; defensively truncate by index value
+    # instead.
+    perm = torch.argsort(all_idx)
+    full_padded = all_embs[perm]                            # (pad_to, D)
+    full = full_padded[:N].contiguous().cpu().numpy().astype(np.float32)
+
+    accelerator.wait_for_everyone()
+
+    if out_dir is not None and accelerator.is_main_process:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        npy_path = out_dir / f"gallery_emb_epoch{epoch_tag}.npy"
+        meta_path = out_dir / f"gallery_emb_epoch{epoch_tag}.meta.json"
+        np.save(npy_path, full)
+        with open(meta_path, "w") as f:
+            json.dump({
+                "encoder_id": "plan10_two_tower_target",
+                "embedding_dim": full.shape[1],
+                "n_images": N,
+                "gallery_ids": gallery_ids,
+                "image_hash": _ids_hash_local(gallery_ids),
+                "epoch_tag": str(epoch_tag),
+            }, f)
+        print(
+            f"[encode_gallery_with_tower] wrote {npy_path} "
+            f"({full.shape}, {full.nbytes / 1e6:.1f} MB)"
+        )
+
+    if was_training:
+        model.train()
+    return full
+
