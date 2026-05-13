@@ -316,14 +316,30 @@ def main() -> None:
         from peft import load_peft_weights, set_peft_model_state_dict
         ckpt = args.resume_from
         unwrapped_for_load = accelerator.unwrap_model(model)
-        for tower_name in ("query_tower", "target_tower"):
-            tower = getattr(unwrapped_for_load, tower_name)
-            peft_weights = load_peft_weights(str(ckpt / tower_name))
-            set_peft_model_state_dict(tower.vlm, peft_weights)
-            tower.proj.load_state_dict(
-                torch.load(str(ckpt / f"head_{tower_name.split('_')[0]}.pt"),
-                           map_location=device)
+        if args.arch == "shared":
+            # Shared variant: one PEFT model with two named adapters
+            # ("query", "target") in a single shared_backbone/ dir, plus
+            # two heads. Adapter weights for both adapters are inside
+            # the single safetensors file as keyed entries.
+            peft_weights = load_peft_weights(str(ckpt / "shared_backbone"))
+            set_peft_model_state_dict(unwrapped_for_load.vlm, peft_weights)
+            unwrapped_for_load.head_query.load_state_dict(
+                torch.load(str(ckpt / "head_query.pt"), map_location=device)
             )
+            unwrapped_for_load.head_target.load_state_dict(
+                torch.load(str(ckpt / "head_target.pt"), map_location=device)
+            )
+        else:
+            # Separate variant: two ContrastiveQwen2VL towers, each with
+            # its own PEFT adapter and head.
+            for tower_name in ("query_tower", "target_tower"):
+                tower = getattr(unwrapped_for_load, tower_name)
+                peft_weights = load_peft_weights(str(ckpt / tower_name))
+                set_peft_model_state_dict(tower.vlm, peft_weights)
+                tower.proj.load_state_dict(
+                    torch.load(str(ckpt / f"head_{tower_name.split('_')[0]}.pt"),
+                               map_location=device)
+                )
         ls_pt = ckpt / "logit_scale.pt"
         if ls_pt.exists():
             accelerator.unwrap_model(loss_fn).load_state_dict(

@@ -23,6 +23,8 @@ design discussion and trade-offs.
 """
 from __future__ import annotations
 
+import contextlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,6 +35,61 @@ from src.training.contrastive_model import ContrastiveQwen2VL
 
 # Locked V1 target prompt (per Plan-10 §4.2). Alternates are V3.
 TARGET_PROMPT = "Describe this image in detail."
+
+
+def make_adapter_restoring_context_fn(peft_model):
+    """PEFT-aware context_fn for torch.utils.checkpoint.checkpoint.
+
+    Captures `peft_model.active_adapter` at forward time, restores it
+    during the backward-pass recompute, and snapshots/restores
+    `requires_grad` on every LoRA param around `set_adapter` to defeat
+    PEFT's trainability side effect (set_adapter flips inactive adapter
+    requires_grad to False; see peft/tuners/tuners_utils.py:1009-1018).
+
+    Without this fix, HF gradient checkpointing's recompute pass would
+    silently use whichever adapter is active when backward runs (i.e.
+    the other branch's adapter), corrupting gradients.
+
+    See Plan_12 §4 for the full design + safety argument.
+    """
+    # Cache the LoRA param list once at factory-construction time.
+    # Recompute fires many times per backward (once per checkpointed
+    # block); avoid walking named_parameters() inside it.
+    lora_params = [
+        (n, p) for n, p in peft_model.named_parameters() if "lora_" in n
+    ]
+
+    def context_fn():
+        # Called at forward time — capture the active adapter via closure.
+        adapter_at_forward = peft_model.active_adapter
+        fwd_ctx = contextlib.nullcontext()
+
+        @contextlib.contextmanager
+        def recompute_ctx_mgr():
+            # Snapshot state at recompute entry.
+            prev_adapter = peft_model.active_adapter
+            prev_grad = [(p, p.requires_grad) for _, p in lora_params]
+
+            # Switch to forward-time adapter. set_adapter flips
+            # requires_grad on all LoRA layers; immediately reassert
+            # True so autograd can accumulate gradients into both
+            # adapters during this recompute.
+            peft_model.set_adapter(adapter_at_forward)
+            for _, p in lora_params:
+                p.requires_grad = True
+            try:
+                yield
+            finally:
+                # Restore active_adapter to what backward saw on entry
+                # (set_adapter again applies the trainability side
+                # effect, then we restore the snapshot below).
+                peft_model.set_adapter(prev_adapter)
+                for p, was_trainable in prev_grad:
+                    p.requires_grad = was_trainable
+
+        return fwd_ctx, recompute_ctx_mgr()
+
+    return context_fn
 
 
 def _target_forward(
@@ -223,7 +280,10 @@ class TwoTowerSharedBackbone(nn.Module):
         - encode_query(images, texts), encode_target(images) on UNWRAPPED model
         - trainable_parameters() -> (q_lora, q_proj, t_lora, t_proj)
 
-    Gradient checkpointing is OFF; see module docstring above.
+    Gradient checkpointing is ON (Plan-12), wrapped with a PEFT-aware
+    context_fn that captures the forward-time adapter and restores it
+    during backward recompute. See `make_adapter_restoring_context_fn`
+    above for the safety argument.
     """
 
     def __init__(self, d_target: int, device_map: str = "cuda:0") -> None:
@@ -271,11 +331,19 @@ class TwoTowerSharedBackbone(nn.Module):
                 p.requires_grad = True
 
         vlm.enable_input_require_grads()
-        # Intentionally NOT calling gradient_checkpointing_enable(). See
-        # module-level docstring. use_cache=False is still set so the
-        # forward path doesn't try to cache key-values across the two
-        # adapter forwards (the cache wouldn't be valid across adapter
-        # switches anyway).
+        # Plan-12: enable gradient checkpointing with a PEFT-aware
+        # context_fn. The context_fn captures the active adapter at
+        # forward time so the backward recompute uses the correct
+        # adapter, not whichever one happens to be active when backward
+        # runs. Without this fix, recompute would silently use the
+        # other branch's adapter and corrupt gradients. See
+        # Plan_12_20260512.md §4 for the full design + safety argument.
+        vlm.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={
+                "use_reentrant": False,
+                "context_fn": make_adapter_restoring_context_fn(vlm),
+            }
+        )
         vlm.config.use_cache = False
 
         # Replace lm_head with a 1-output stub — we never use logits, only
