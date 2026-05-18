@@ -31,6 +31,7 @@ import argparse
 import json
 import math
 import time
+from datetime import timedelta
 from pathlib import Path
 
 try:
@@ -43,7 +44,11 @@ import numpy as np
 import torch
 import torch.utils.data as tud
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs, set_seed
+from accelerate.utils import (
+    DistributedDataParallelKwargs,
+    InitProcessGroupKwargs,
+    set_seed,
+)
 
 from src.data.contrastive_dataset import FacapContrastiveDataset, contrastive_collate
 from src.data.facap_dataset import FacapDataset
@@ -97,10 +102,23 @@ def parse_args() -> argparse.Namespace:
                    help="Trigger the existing eval pipeline once after step N "
                         "(default 5). Catches OOM / sharding bugs early without a "
                         "parallel smoke harness. Set 0 to disable.")
+    p.add_argument("--eval-batch-size", type=int, default=16,
+                   help="Batch size for the online-eval encodes (dev loss, "
+                        "retrieval, sensitivity probe). The audio-query eval "
+                        "forward is heavy — keep this small (the default 32 "
+                        "for dev loss OOMs a 24 GB card in audio mode).")
     p.add_argument("--dev-seed", type=int, default=42)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--max-mod-len", type=int, default=512)
+    p.add_argument("--query-modality", choices=["text", "audio"], default="text",
+                   help="Query-side modification input. 'text' reproduces "
+                        "Plan-13; 'audio' is the Plan-15 audio-native query "
+                        "tower (requires --arch shared).")
+    p.add_argument("--audio-manifest", type=Path,
+                   default=Path("/tmp3/zhuoyuan/plan14_audio/manifest.json"),
+                   help="Plan-14 M2 audio manifest (used when "
+                        "--query-modality audio).")
     p.add_argument("--gather", action="store_true",
                    help="all_gather cross-GPU negatives (multi-GPU mode)")
     p.add_argument("--lr-schedule", choices=["none", "cosine"], default="none",
@@ -210,9 +228,22 @@ def _check_grad_receipt(unwrapped, accelerator) -> None:
 def main() -> None:
     args = parse_args()
 
+    if args.query_modality == "audio" and args.arch != "shared":
+        raise SystemExit(
+            "--query-modality audio requires --arch shared (Plan 15 §3)."
+        )
+
     log_with = [] if args.no_wandb else ["wandb"]
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(log_with=log_with, kwargs_handlers=[ddp_kwargs])
+    # The audio eval runs on rank 0 only and is slow (audio decode + the
+    # Whisper encoder forward); the other ranks meanwhile idle inside the next
+    # step's NCCL collective. Extend the process-group timeout well past one
+    # eval's wall-clock so the watchdog does not abort them — the audio eval
+    # is far slower than the text eval Plan-13 ran under the 10-min default.
+    init_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=120))
+    accelerator = Accelerator(
+        log_with=log_with, kwargs_handlers=[ddp_kwargs, init_kwargs]
+    )
     set_seed(args.seed)
 
     accelerator.print(f"=== Plan-10 V1 (Option B) two-tower training ===")
@@ -235,8 +266,28 @@ def main() -> None:
         dev_seed=args.dev_seed,
         dev_slice_json=dev_slice_json if accelerator.is_main_process else None,
         load_target=True,        # Plan-10: yield tgt_image PIL per item
+        query_modality=args.query_modality,
+        audio_manifest=(args.audio_manifest
+                        if args.query_modality == "audio" else None),
     )
     accelerator.print(train_ds.summary())
+
+    # Pre-resolve in-distribution-voice audio paths for the eval slices
+    # (constant across the run). None in text mode — the text eval path is
+    # unchanged.
+    if args.query_modality == "audio":
+        _in_dist = train_ds.audio_manifest["in_dist"]
+        dev_audios = [_in_dist[str(it["triplet_index"])]["wav"]
+                      for it in train_ds.dev_items]
+        headline_audios = [_in_dist[str(it["triplet_index"])]["wav"]
+                           for it in train_ds.headline_items]
+        accelerator.print(
+            f"audio-query mode: {len(dev_audios)} dev + "
+            f"{len(headline_audios)} headline in-dist-voice clips resolved"
+        )
+    else:
+        dev_audios = None
+        headline_audios = None
 
     train_loader = tud.DataLoader(
         train_ds,
@@ -268,6 +319,7 @@ def main() -> None:
         model = TwoTowerSharedBackbone(
             d_target=args.d_target,
             device_map=f"cuda:{accelerator.local_process_index}",
+            query_modality=args.query_modality,
         )
     else:  # "separate" (default — Option B)
         model = TwoTowerSeparateBackbones(
@@ -376,16 +428,25 @@ def main() -> None:
         date_str = time.strftime("%Y%m%d")
         arch_label = "shared" if args.arch == "shared" else "separate"
         option_tag = "option-a" if args.arch == "shared" else "option-b"
-        run_name = args.wandb_run_name or (
-            f"plan10/v1_{arch_label}_bs{args.batch_size}"
-            f"_{accelerator.num_processes}x{_gpu_class()}_{date_str}"
-        )
+        if args.query_modality == "audio":
+            run_name = args.wandb_run_name or (
+                f"plan14/audio_query_{arch_label}_bs{args.batch_size}"
+                f"_{accelerator.num_processes}x{_gpu_class()}_{date_str}"
+            )
+            wandb_tags = ["phase-c", "plan15", "two-tower", "audio-query",
+                          option_tag]
+        else:
+            run_name = args.wandb_run_name or (
+                f"plan10/v1_{arch_label}_bs{args.batch_size}"
+                f"_{accelerator.num_processes}x{_gpu_class()}_{date_str}"
+            )
+            wandb_tags = ["phase-b", "plan10", "two-tower", option_tag]
         accelerator.init_trackers(
             project_name=args.wandb_project,
             config=vars(args),
             init_kwargs={"wandb": {
                 "name": run_name,
-                "tags": ["phase-b", "plan10", "two-tower", option_tag],
+                "tags": wandb_tags,
             }},
         )
 
@@ -437,10 +498,15 @@ def main() -> None:
         dev_loss = run_dev_loss_two_tower(
             unwrapped_model, unwrapped_loss_fn,
             train_ds.dev_items, tid_to_idx, base_ds, device,
+            batch_size=args.eval_batch_size,
+            query_modality=args.query_modality, dev_audios=dev_audios,
         )
         probe = run_dev_probe(
             unwrapped_model, train_ds.dev_items, gallery_db, base_ds,
-            train_ds.train_mod_texts, seed=args.dev_seed,
+            train_ds.train_mod_texts, batch_size=args.eval_batch_size,
+            seed=args.dev_seed,
+            query_modality=args.query_modality,
+            dev_audios=dev_audios, train_mod_audios=train_ds.train_mod_audios,
         )
         normal = probe["normal"]
         stripped = probe["mod_stripped"]
@@ -448,6 +514,8 @@ def main() -> None:
         sensitivity_gap = normal.recall[10] - stripped.recall[10]
         headline_result = run_retrieval_eval(
             unwrapped_model, train_ds.headline_items, gallery_db, base_ds,
+            batch_size=args.eval_batch_size,
+            query_modality=args.query_modality, mod_audios=headline_audios,
         )
 
         metric_row = {
@@ -495,12 +563,15 @@ def main() -> None:
         model.train()
         for batch in train_loader:
             cand_images = batch["cand_images"]
-            mod_texts = batch["mod_texts"]
+            if args.query_modality == "audio":
+                query_mods = batch["mod_audios"]
+            else:
+                query_mods = batch["mod_texts"]
             tgt_images = batch["tgt_images"]
             target_ids: list[str] = batch["target_ids"]
 
             # DDP-safe forward: parent module's forward returns (q_emb, t_emb)
-            q_embs, t_embs = model(cand_images, mod_texts, tgt_images)
+            q_embs, t_embs = model(cand_images, query_mods, tgt_images)
 
             tid_tensor = torch.tensor(
                 [tid_to_idx[tid] for tid in target_ids],

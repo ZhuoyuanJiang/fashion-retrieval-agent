@@ -29,12 +29,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
+from qwen_vl_utils import process_vision_info
 
 from src.training.contrastive_model import ContrastiveQwen2VL
 
 
 # Locked V1 target prompt (per Plan-10 §4.2). Alternates are V3.
 TARGET_PROMPT = "Describe this image in detail."
+
+# Plan 15 §3.5: the fixed query instruction for the audio modality. Constant
+# task framing — it carries NO modification content (the modification rides
+# entirely in the spoken audio). Locked value (same as the M1 smoke test).
+INSTR = (
+    "Given this product image, find the item that looks like the image "
+    "but with the modification described in the spoken audio."
+)
 
 
 def make_adapter_restoring_context_fn(peft_model):
@@ -286,9 +295,15 @@ class TwoTowerSharedBackbone(nn.Module):
     above for the safety argument.
     """
 
-    def __init__(self, d_target: int, device_map: str = "cuda:0") -> None:
+    def __init__(self, d_target: int, device_map: str = "cuda:0",
+                 query_modality: str = "text") -> None:
         super().__init__()
         self.d_target = d_target
+        if query_modality not in ("text", "audio"):
+            raise ValueError(
+                f"query_modality must be 'text' or 'audio', got {query_modality!r}"
+            )
+        self.query_modality = query_modality
 
         # Use the same backbone loader as ContrastiveQwen2VL so Stage-2 LoRA
         # is merged into the base BEFORE our adapters get attached.
@@ -309,10 +324,16 @@ class TwoTowerSharedBackbone(nn.Module):
         # Attach the first PEFT adapter as "query"; this also wraps vlm in
         # a PeftModel and sets active_adapter="query" by default.
         from peft import LoraConfig, get_peft_model
+        # Plan 15 §3.2: LORA_TARGET_MODULES is a plain suffix-match list, so
+        # PEFT would otherwise attach LoRA to the frozen Whisper audio_encoder's
+        # q/k/v_proj. `exclude_modules` keeps the audio encoder genuinely frozen
+        # by never creating those adapters — robust against the three
+        # blanket `requires_grad=True`-on-all-lora_ resets in this class.
         lora_cfg = LoraConfig(
             r=LORA_RANK,
             lora_alpha=LORA_ALPHA,
             target_modules=LORA_TARGET_MODULES,
+            exclude_modules=r".*audio_encoder.*",
             lora_dropout=0.0,
             bias="none",
             task_type="CAUSAL_LM",
@@ -329,6 +350,16 @@ class TwoTowerSharedBackbone(nn.Module):
         for n, p in vlm.named_parameters():
             if "lora_" in n:
                 p.requires_grad = True
+
+        # Plan 15 §3.2 / §5: assert exclude_modules took effect — no LoRA may
+        # live under audio_encoder, or the audio run would silently train the
+        # frozen Whisper encoder.
+        _audio_lora = [n for n, _ in vlm.named_parameters()
+                       if "lora_" in n and "audio_encoder" in n]
+        assert not _audio_lora, (
+            f"exclude_modules failed: {len(_audio_lora)} LoRA params attached "
+            f"under audio_encoder, e.g. {_audio_lora[:2]}"
+        )
 
         vlm.enable_input_require_grads()
         # Plan-12: enable gradient checkpointing with a PEFT-aware
@@ -375,32 +406,48 @@ class TwoTowerSharedBackbone(nn.Module):
     def _forward_one_side(
         self,
         images: list[Image.Image],
-        texts: list[str],
+        texts: list[str] | None,
         head: nn.Module,
         side: str,                # "query" or "target"
+        audios: list[str | None] | None = None,
         max_mod_len: int = 512,
     ) -> torch.Tensor:
         """Build prompt, run vlm, pool, project, L2-normalize. Caller is
         responsible for calling `self.vlm.set_adapter(...)` before this.
+
+        Query side, query_modality=="audio": the message is
+        [image, audio, INSTR] — the modification rides entirely in the audio.
+        `audios[k] is None` yields an image-only [image, INSTR] message
+        (the sensitivity-probe stripped arm). Target side is always
+        [image, TARGET_PROMPT]; text query side is unchanged.
         """
         B = len(images)
+        use_audio = (side == "query" and self.query_modality == "audio")
+
         messages_list = []
-        for img, txt in zip(images, texts):
+        for k in range(B):
+            img = images[k]
             if side == "target":
-                instr = TARGET_PROMPT
+                content = [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": TARGET_PROMPT},
+                ]
+            elif use_audio:
+                content = [{"type": "image", "image": img}]
+                if audios is not None and audios[k] is not None:
+                    content.append({"type": "audio", "audio": audios[k]})
+                content.append({"type": "text", "text": INSTR})
             else:
-                txt = txt[:max_mod_len]
+                txt = texts[k][:max_mod_len]
                 instr = (
                     _QUERY_INSTR_WITH_MOD.format(txt=txt) if txt
                     else _QUERY_INSTR_NO_MOD
                 )
-            messages_list.append([{
-                "role": "user",
-                "content": [
+                content = [
                     {"type": "image", "image": img},
                     {"type": "text", "text": instr},
-                ],
-            }])
+                ]
+            messages_list.append([{"role": "user", "content": content}])
 
         text_inputs = [
             self.processor.apply_chat_template(
@@ -410,12 +457,26 @@ class TwoTowerSharedBackbone(nn.Module):
         ]
 
         device = next(self.vlm.parameters()).device
-        inputs = self.processor(
-            text=text_inputs,
-            images=images,
-            return_tensors="pt",
-            padding=True,
-        )
+        if use_audio:
+            # Audio query: extract audio (+ image) inputs from the messages,
+            # exactly as the verified M1 smoke path does.
+            image_inputs, video_inputs, audio_inputs = process_vision_info(
+                messages_list
+            )
+            proc_kwargs = dict(
+                text=text_inputs, images=image_inputs, videos=video_inputs,
+                return_tensors="pt", padding=True,
+            )
+            if audio_inputs:
+                proc_kwargs["audios"] = audio_inputs
+            inputs = self.processor(**proc_kwargs)
+        else:
+            inputs = self.processor(
+                text=text_inputs,
+                images=images,
+                return_tensors="pt",
+                padding=True,
+            )
         inputs = {
             k: v.to(device) if hasattr(v, "to") else v
             for k, v in inputs.items()
@@ -445,10 +506,13 @@ class TwoTowerSharedBackbone(nn.Module):
     def forward(
         self,
         cand_images: list[Image.Image],
-        mod_texts: list[str],
+        query_mods: list,
         tgt_images: list[Image.Image],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """DDP-safe training entry point.
+
+        `query_mods` is the per-sample query modification: text strings when
+        query_modality=="text", wav paths when "audio".
 
         Calls vlm twice with the per-side LoRA adapter active. The PEFT
         set_adapter call mutates `model.active_adapter` AND flips
@@ -460,9 +524,15 @@ class TwoTowerSharedBackbone(nn.Module):
         Returns (q_emb, t_emb), both (B, D) fp32 L2-normalized.
         """
         self.vlm.set_adapter("query")
-        q_emb = self._forward_one_side(
-            cand_images, mod_texts, self.head_query, side="query"
-        )
+        if self.query_modality == "audio":
+            q_emb = self._forward_one_side(
+                cand_images, None, self.head_query, side="query",
+                audios=query_mods,
+            )
+        else:
+            q_emb = self._forward_one_side(
+                cand_images, query_mods, self.head_query, side="query",
+            )
 
         self.vlm.set_adapter("target")
         t_emb = self._forward_one_side(
@@ -482,12 +552,17 @@ class TwoTowerSharedBackbone(nn.Module):
     def encode_query(
         self,
         images: list[Image.Image],
-        texts: list[str],
+        query_mods: list,
     ) -> torch.Tensor:
-        """Eval-only. Call on the UNWRAPPED model."""
+        """Eval-only. Call on the UNWRAPPED model. `query_mods` = text strings
+        or wav paths (per query_modality; a None entry = image-only)."""
         self.vlm.set_adapter("query")
+        if self.query_modality == "audio":
+            return self._forward_one_side(
+                images, None, self.head_query, side="query", audios=query_mods,
+            )
         return self._forward_one_side(
-            images, texts, self.head_query, side="query"
+            images, query_mods, self.head_query, side="query",
         )
 
     @torch.inference_mode()

@@ -43,11 +43,16 @@ def run_retrieval_eval(
     base_ds: FacapDataset,
     mod_texts: list[str] | None = None,
     batch_size: int = 16,
+    query_modality: str = "text",
+    mod_audios: list | None = None,
 ) -> EvalResult:
     """Evaluate items against gallery_db.
 
-    mod_texts: if None, uses item["modification_text"] (normal mode).
-               Pass [""] * N for mod-stripped, or a pre-shuffled list for mod-shuffled.
+    Text mode (query_modality=="text"): `mod_texts` — if None, uses
+    item["modification_text"] (normal); pass [""] * N for mod-stripped, or a
+    pre-shuffled list for mod-shuffled.
+    Audio mode (query_modality=="audio"): `mod_audios` — a per-item list of
+    wav paths (a None entry = image-only / stripped). Required when audio.
     """
     was_training = model.training
     model.eval()
@@ -56,15 +61,17 @@ def run_retrieval_eval(
     for i in range(0, len(items), batch_size):
         chunk = items[i:i + batch_size]
         images = [base_ds.load_image(it, "candidate") for it in chunk]
-        if mod_texts is not None:
-            texts = mod_texts[i:i + batch_size]
+        if query_modality == "audio":
+            assert mod_audios is not None, "audio eval requires mod_audios"
+            mods = mod_audios[i:i + batch_size]
+        elif mod_texts is not None:
+            mods = mod_texts[i:i + batch_size]
         else:
-            texts = [it["modification_text"] for it in chunk]
+            mods = [it["modification_text"] for it in chunk]
 
-        # Both ContrastiveQwen2VL and TwoTowerSeparateBackbones expose
-        # encode_query(images, texts); for Plan-5/6/7 it's equivalent to
-        # model(images, texts), for Plan-10 it routes to query_tower only.
-        q_embs = model.encode_query(images, texts).cpu().float().numpy()  # (B, D)
+        # encode_query routes to the query tower; it takes text strings or
+        # (audio mode) wav paths per the model's query_modality.
+        q_embs = model.encode_query(images, mods).cpu().float().numpy()  # (B, D)
         for j, it in enumerate(chunk):
             ranks.append(rank_of(it["target_id"], q_embs[j], gallery_db))
 
@@ -81,15 +88,43 @@ def run_dev_probe(
     train_mod_texts: list[str],
     batch_size: int = 16,
     seed: int = 42,
+    query_modality: str = "text",
+    dev_audios: list[str] | None = None,
+    train_mod_audios: list[str] | None = None,
 ) -> dict[str, EvalResult]:
     """3-way sensitivity probe on the dev slice.
 
     Returns dict with keys 'normal', 'mod_stripped', 'mod_shuffled'.
     The gap R@10(normal) − R@10(mod_stripped) must be > 0 by 0.25 epoch
     (warning if violated — see Plan-5 §7).
+
+    Audio mode (Plan 15 §3.4): normal = each dev item's real clip
+    (`dev_audios`); stripped = image-only (no audio); shuffled = another
+    item's clip drawn from `train_mod_audios`.
     """
     rng = np.random.RandomState(seed)
-    # Draw unique shuffled mods from the training pool
+
+    if query_modality == "audio":
+        assert dev_audios is not None and train_mod_audios is not None, \
+            "audio dev probe requires dev_audios + train_mod_audios"
+        pool = np.array(train_mod_audios)
+        idx = rng.choice(len(pool), size=len(dev_items),
+                         replace=len(pool) < len(dev_items))
+        shuffled = pool[idx].tolist()
+        stripped = [None] * len(dev_items)
+        return {
+            "normal":       run_retrieval_eval(
+                model, dev_items, gallery_db, base_ds, batch_size=batch_size,
+                query_modality="audio", mod_audios=dev_audios),
+            "mod_stripped": run_retrieval_eval(
+                model, dev_items, gallery_db, base_ds, batch_size=batch_size,
+                query_modality="audio", mod_audios=stripped),
+            "mod_shuffled": run_retrieval_eval(
+                model, dev_items, gallery_db, base_ds, batch_size=batch_size,
+                query_modality="audio", mod_audios=shuffled),
+        }
+
+    # Text mode — draw unique shuffled mods from the training pool
     pool = np.array(train_mod_texts)
     idx = rng.choice(len(pool), size=len(dev_items), replace=len(pool) < len(dev_items))
     shuffled_mods = pool[idx].tolist()
@@ -205,6 +240,8 @@ def run_dev_loss_two_tower(
     base_ds: FacapDataset,
     device: torch.device,
     batch_size: int = 32,
+    query_modality: str = "text",
+    dev_audios: list[str] | None = None,
 ) -> float:
     """Plan-10 multi-positive InfoNCE on the full dev set.
 
@@ -231,9 +268,13 @@ def run_dev_loss_two_tower(
         chunk = dev_items[i:i + batch_size]
         cand_images = [base_ds.load_image(it, "candidate") for it in chunk]
         tgt_images = [base_ds.load_image(it, "target") for it in chunk]
-        texts = [it["modification_text"] for it in chunk]
+        if query_modality == "audio":
+            assert dev_audios is not None, "audio dev loss requires dev_audios"
+            mods = dev_audios[i:i + batch_size]
+        else:
+            mods = [it["modification_text"] for it in chunk]
 
-        q_embs = model.encode_query(cand_images, texts).cpu().float()
+        q_embs = model.encode_query(cand_images, mods).cpu().float()
         t_embs = model.encode_target(tgt_images).cpu().float()
         tids = torch.tensor(
             [tid_to_idx[it["target_id"]] for it in chunk], dtype=torch.int64

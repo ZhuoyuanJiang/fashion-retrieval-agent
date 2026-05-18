@@ -55,10 +55,17 @@ class FacapContrastiveDataset(Dataset):
         dev_seed: int = 42,
         dev_slice_json: Path | str | None = None,
         load_target: bool = False,
+        query_modality: str = "text",
+        audio_manifest: Path | str | None = None,
     ) -> None:
         self.base = base
         self.dev_seed = dev_seed
         self.load_target = load_target
+        if query_modality not in ("text", "audio"):
+            raise ValueError(
+                f"query_modality must be 'text' or 'audio', got {query_modality!r}"
+            )
+        self.query_modality = query_modality
 
         N = len(base)
         if N <= HEADLINE_SLICE_SIZE + DEV_SLICE_SIZE:
@@ -70,6 +77,11 @@ class FacapContrastiveDataset(Dataset):
         # Step 1: headline slice = last 1000 triplets
         headline_base_indices = list(range(N - HEADLINE_SLICE_SIZE, N))
         self.headline_items: list[dict[str, Any]] = [base[i] for i in headline_base_indices]
+        # Plan 15 §3.1: every eval item carries its FACap triplet index so the
+        # audio path can look the clip up in the manifest. Pure additive — the
+        # text path ignores the key.
+        for k, bi in enumerate(headline_base_indices):
+            self.headline_items[k]["triplet_index"] = int(bi)
         headline_ids: set[str] = set()
         for it in self.headline_items:
             headline_ids.add(it["target_id"])
@@ -89,6 +101,8 @@ class FacapContrastiveDataset(Dataset):
         self.dev_items: list[dict[str, Any]] = [
             base[clean_indices[p]] for p in perm[:DEV_SLICE_SIZE]
         ]
+        for k, p in enumerate(perm[:DEV_SLICE_SIZE]):
+            self.dev_items[k]["triplet_index"] = int(clean_indices[p])
         dev_ids: set[str] = set()
         for it in self.dev_items:
             dev_ids.add(it["target_id"])
@@ -118,6 +132,23 @@ class FacapContrastiveDataset(Dataset):
             base[i]["modification_text"] for i in self._train_indices
         ]
 
+        # Audio-query manifest (Plan 15 §3.1). When query_modality=="audio",
+        # every modification is a synthesized wav looked up by triplet index.
+        self.audio_manifest: dict | None = None
+        self.train_mod_audios: list[str] | None = None
+        if self.query_modality == "audio":
+            if audio_manifest is None:
+                raise ValueError(
+                    "query_modality='audio' requires audio_manifest"
+                )
+            with open(audio_manifest) as f:
+                self.audio_manifest = json.load(f)
+            self._assert_manifest_complete()
+            in_dist = self.audio_manifest["in_dist"]
+            self.train_mod_audios = [
+                in_dist[str(i)]["wav"] for i in self._train_indices
+            ]
+
         # Optionally dump dev slice for reproducibility logging
         if dev_slice_json is not None:
             dev_slice_json = Path(dev_slice_json)
@@ -135,17 +166,53 @@ class FacapContrastiveDataset(Dataset):
                     indent=2,
                 )
 
+    def _assert_manifest_complete(self) -> None:
+        """Plan 15 §3.1 — fail fast at construction if the audio manifest does
+        not cover every train/dev/headline triplet with matching split labels.
+
+        The `--query-modality text` control never exercises the audio lookup,
+        so this assertion (not the text control) is what guards the indexing.
+        """
+        m = self.audio_manifest
+        in_dist, ood = m["in_dist"], m["ood"]
+        for i in self._train_indices:
+            rec = in_dist.get(str(i))
+            assert rec is not None, \
+                f"audio manifest in_dist missing train triplet {i}"
+            assert rec["split"] == "train", (
+                f"manifest split mismatch for triplet {i}: "
+                f"manifest={rec['split']!r}, dataset='train'"
+            )
+        for split_name, items in (("dev", self.dev_items),
+                                  ("headline", self.headline_items)):
+            for it in items:
+                i = it["triplet_index"]
+                for cond_name, cond in (("in_dist", in_dist), ("ood", ood)):
+                    rec = cond.get(str(i))
+                    assert rec is not None, (
+                        f"audio manifest {cond_name} missing "
+                        f"{split_name} triplet {i}"
+                    )
+                    assert rec["split"] == split_name, (
+                        f"manifest split mismatch for triplet {i}: "
+                        f"manifest={rec['split']!r}, dataset={split_name!r}"
+                    )
+
     def __len__(self) -> int:
         return len(self._train_indices)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        item = self.base[self._train_indices[idx]]
+        base_idx = self._train_indices[idx]
+        item = self.base[base_idx]
         cand_image = self.base.load_image(item, "candidate")
         out: dict[str, Any] = {
             "cand_image": cand_image,
             "mod_text": item["modification_text"],
             "target_id": item["target_id"],
+            "triplet_index": int(base_idx),
         }
+        if self.query_modality == "audio":
+            out["mod_audio"] = self.audio_manifest["in_dist"][str(base_idx)]["wav"]
         if self.load_target:
             out["tgt_image"] = self.base.load_image(item, "target")
         return out
@@ -172,6 +239,10 @@ def contrastive_collate(batch: list[dict]) -> dict:
         "mod_texts": [item["mod_text"] for item in batch],
         "target_ids": [item["target_id"] for item in batch],
     }
+    if "triplet_index" in batch[0]:
+        out["triplet_indices"] = [item["triplet_index"] for item in batch]
+    if "mod_audio" in batch[0]:
+        out["mod_audios"] = [item["mod_audio"] for item in batch]
     if "tgt_image" in batch[0]:
         out["tgt_images"] = [item["tgt_image"] for item in batch]
     return out

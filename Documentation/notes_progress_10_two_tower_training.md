@@ -410,3 +410,78 @@ When you're training on **structured data with uniform shape** (e.g., fixed-size
 It's one of those things that's invisible in a fixed-size workload but shows up loudly with vision models and especially multimodal models like Qwen2-VL.
 
 **One sentence to remember:** the 7 GB rank spread happens because each rank sees different data, image sizes vary across the dataset, the caching allocator never gives back reserved memory, so whichever rank drew the biggest images first stays at the highest reservation for the rest of training.
+
+---
+
+## Q8: What does `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` do — and does it slow training down?
+
+### Context
+
+Q6 explained why the default CUDA caching allocator makes `nvidia-smi memory.used` a *coarse step function* of batch size: it reserves memory in fixed chunks, never returns them, and overshoots. The Plan-15 audio run was launched with the environment variable `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, which directly attacks that overshoot.
+
+Concrete payoff observed: the Plan-13 *text* run (default allocator) reported `nvidia-smi` = **44.8 GB** at bs=24; the Plan-15 *audio* run (this flag on) reports only **~38 GB** at the larger bs=32. The live tensor memory of the two is actually similar — a large part of that gap is the default allocator's reservation overshoot, which `expandable_segments` removes. (So the audio modality is **not** more memory-efficient than text; the apparent difference is mostly the allocator setting plus a measurement mismatch — see Q6 on `reserved` vs `allocated`.)
+
+This Q is the from-scratch version of "how GPU memory allocation actually works," for anyone without an OS/systems background.
+
+### Answer
+
+This is operating-systems territory — **dynamic memory allocation** and **fragmentation** — plus a thin CUDA-specific layer. A parking-garage analogy carries the whole thing:
+
+| Concept | Analogy |
+|---|---|
+| GPU VRAM (the 49 GB) | all the parking spaces in a garage |
+| the CUDA **driver** | the attendant who owns the garage and assigns spaces |
+| `cudaMalloc` | walking up to the attendant to request space |
+| a **tensor** | a car |
+| PyTorch's **caching pool** | a whole section you lease up front and manage yourself |
+| a **segment** | one fixed-length *row* inside your leased section |
+
+#### Why memory must be "requested from the driver"
+
+GPU VRAM is a shared physical resource. A process cannot just grab it — the **driver** owns the physical memory and hands it out. To get memory you call `cudaMalloc(N)`; the driver finds N free bytes, marks them yours, returns a pointer; `cudaFree` gives them back. The catch: **these calls are slow** (~milliseconds — they involve the driver, synchronization, bookkeeping).
+
+#### Why PyTorch hoards memory (the caching pool)
+
+A training step creates and destroys *thousands* of intermediate tensors. If each one cost a `cudaMalloc`/`cudaFree`, training would crawl. So PyTorch keeps its own **caching pool**:
+
+- It `cudaMalloc`s a big chunk up front (leases a garage section).
+- When your Python code frees a tensor, PyTorch does **not** return that memory to the driver — it just marks that slot in the pool "free again" and keeps it.
+- The next tensor of a similar size reuses that slot — **no driver call**, instant.
+
+This is why `memory_reserved` (what PyTorch holds from the driver) ≥ `memory_allocated` (what live tensors actually occupy), and why `nvidia-smi` (≈ reserved) can show a big number even when live tensors are small: it shows the *leased section*, not the *cars currently parked*.
+
+#### Fragmentation — why the reserved pool balloons
+
+One hard rule: a tensor must occupy **one contiguous block** of memory — it cannot be split across two separate gaps (a bus needs one unbroken stretch of curb).
+
+In the default allocator the pool is made of **segments**, and each segment is a **fixed size that cannot grow**. Picture one row of 10 spaces after cars of many sizes have come and gone:
+
+```
+[free][free][car][car][car][free][car][car][car][free]
+```
+
+4 spaces are free — but **scattered**: 2, then 1, then 1. A vehicle needing **4 contiguous** spaces cannot park, even though the total free count is enough. That scattered-free-space state is **fragmentation**.
+
+When it happens, the allocator can't place the new large tensor in any existing segment, so it is forced to `cudaMalloc` a **whole new segment** just for that one tensor. PyTorch's reserved memory jumps up — while the holes in the old segments sit unused. The reserved/`nvidia-smi` number balloons not because the job truly needs that much, but because usable space got chopped into unusable holes. This is exactly the "grabbed an extra chunk at epoch 4" creep noted in Progress_12 §11.2.
+
+#### What `expandable_segments:True` changes
+
+The root problem is the **fixed-size segment**. `expandable_segments:True` rebuilds a segment using the GPU's **virtual-memory APIs**, which separate two things:
+
+- the **address** of memory (just a number — reserving an address range is cheap), and
+- the **physical memory** mapped behind that address.
+
+An expandable segment first reserves a large *address range*, then maps **physical pages into it incrementally, as needed**, and can **map more pages onto the end of the same segment later**. The row of parking spaces can now be **paved longer in place** instead of forcing a brand-new full row.
+
+Result: far fewer separate segments, far fewer scattered holes, and `memory_reserved` tracks `memory_allocated` tightly (the overshoot from Q6 mostly disappears). Fewer fragmentation-driven OOMs, and you can safely run closer to the card's physical limit.
+
+#### Does it slow training down? — No, not meaningfully
+
+- **Compute is untouched.** The flag only changes how memory *addresses* are managed. The actual kernels (matmul, attention) run identically; numerics are unchanged.
+- **The only overhead is at driver-touching allocation events** — mapping/unmapping physical pages via the virtual-memory APIs is marginally heavier per call than the default's plain `cudaMalloc` bookkeeping.
+- **But those events stop happening after warm-up.** Transformer training allocates the *same tensor shapes every step*, so within the first epoch the pool reaches steady state and stops growing — after that there are essentially no driver calls, and steady-state training pays ~zero overhead.
+- Net effect is within run-to-run noise (typically <1–2%). Under memory pressure it can even be *faster*, because it avoids the default allocator's "release a big segment, then `cudaMalloc` it again" churn. PyTorch recommends it for fragmentation-prone workloads; once marked "experimental," now stable and widely used.
+
+### One sentence to remember
+
+The default allocator builds the pool from **fixed-length rows** — when one fills it must lease a whole new row, so reserved memory overshoots; `expandable_segments` makes each row **lengthen in place**, so reserved memory hugs the real need — at no meaningful speed cost, because compute is untouched and the pool stops growing after warm-up.
