@@ -8,6 +8,7 @@
 #   bash scripts/run_demo.sh                        # v0.1 default (no GPU needed)
 #   DEMO_STAGE=v0.2 bash scripts/run_demo.sh        # v0.2 (Pipeline 2 + Whisper live; needs ≥24 GB GPU)
 #   DEMO_STAGE=v0.3 bash scripts/run_demo.sh        # v0.3 (Pipeline 1 also live; needs ≥49 GB GPU)
+#   LIVE_AUDIO=1 bash scripts/run_demo.sh           # also build the live audio row (Plan-15 two-tower; needs a GPU)
 #   GRADIO_SHARE=1 bash scripts/run_demo.sh         # also expose a *.gradio.live public URL (72h)
 #
 # Stages:
@@ -33,14 +34,17 @@ cd "$REPO_ROOT"
 export DEMO_STAGE="${DEMO_STAGE:-v0.1}"
 export GRADIO_SERVER_PORT="${GRADIO_SERVER_PORT:-7860}"
 export GRADIO_SHARE="${GRADIO_SHARE:-0}"
+export LIVE_AUDIO="${LIVE_AUDIO:-0}"
+export LIVE_AUDIO_DEVICE="${LIVE_AUDIO_DEVICE:-cuda:0}"
 
 # Per-user gradio scratch dir — /tmp/gradio is shared across lab users and
 # tends to be locked down by whoever ran first. Override to a private location.
 export GRADIO_TEMP_DIR="${GRADIO_TEMP_DIR:-$HOME/.cache/gradio_tmp_$USER}"
 mkdir -p "$GRADIO_TEMP_DIR"
 
-# v0.2+ uses HF cache. Default to a local SSD path; honour an explicit override.
-if [[ "$DEMO_STAGE" != "v0.1" ]]; then
+# v0.2+ and the live audio row load the ~9B base model from the HF cache.
+# Pin it to a local SSD so weights never land on NAS home; honour an override.
+if [[ "$DEMO_STAGE" != "v0.1" || "$LIVE_AUDIO" == "1" ]]; then
     export HF_HOME="${HF_HOME:-/ssd1/zhuoyuan/hf_cache}"
     export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME}"
     export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME}"
@@ -48,7 +52,7 @@ fi
 
 PYTHON_BIN="${PYTHON_BIN:-/home/zhuoyuan/miniconda3/envs/fashion_retrieval/bin/python}"
 
-echo "[run_demo] stage=$DEMO_STAGE  port=$GRADIO_SERVER_PORT  share=$GRADIO_SHARE"
+echo "[run_demo] stage=$DEMO_STAGE  port=$GRADIO_SERVER_PORT  share=$GRADIO_SHARE  live_audio=$LIVE_AUDIO"
 echo "[run_demo] repo=$REPO_ROOT"
 echo "[run_demo] python=$PYTHON_BIN"
 
