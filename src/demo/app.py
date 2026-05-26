@@ -634,13 +634,629 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
+# ---------------------------------------------------------------------------
+# v2 demo — "A + B = C": reference image ➕ modification 🟰 retrieved target
+# ---------------------------------------------------------------------------
+# Reads the same cached preset_cache.json as v1, so v2 needs no GPU. The unit is
+# a *preset* (= candidate image + modification text + spoken clip + cached
+# results for all 4 pipelines + ground truth). The whole query→answer reads as
+# one left-to-right equation on a single row, so nothing needs scrolling: the
+# reference garment, the spoken/typed modification, and the top-1 target sit
+# side by side; the rest of the Top-K hangs directly underneath.
+
+_V2_CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩"
+_V2_MODES = {                       # radio label -> preset_cache result key
+    "P1 — Caption baseline": "p1",
+    "P2 — Direct embedding": "p2",
+    "P3 — Text two-tower": "text2t",
+    "P4 — Audio two-tower": "audio2t",
+}
+_V2_DEMO = "🎬 Demo — compare all four"
+_V2_MODE_CHOICES = [*_V2_MODES.keys(), _V2_DEMO]
+_V2_SHORT = {                       # compact name for Demo-strip captions
+    "P1 — Caption baseline": "P1 caption",
+    "P2 — Direct embedding": "P2 direct",
+    "P3 — Text two-tower": "P3 text two-tower",
+    "P4 — Audio two-tower": "P4 audio two-tower",
+}
+
+_V2_PIPELINE_EXPLAINER = """\
+Every pipeline ends the same way: **pre-compute an embedding index over the
+~59k-image gallery (offline), then encode the query and do a cosine
+nearest-neighbour search against that index (online).** They differ only in how
+the query vector is produced.
+
+### 🅿️1 — Caption baseline
+1. **Offline (once):** caption every gallery image, embed each caption with
+   Marqo-FashionCLIP, store a **caption-embedding index** (~59k × d).
+2. **Online:** Qwen2-VL-7B reads (reference image + text modification) → writes a
+   one-sentence target caption.
+3. Embed that caption with Marqo-FashionCLIP → **one query vector**.
+4. **Cosine similarity search** against the index → Top-K.
+&nbsp;·&nbsp; R@10 = 0.533
+
+### 🅿️2 — Direct embedding
+1. **Offline:** encode every gallery image with the FashionCLIP image encoder →
+   store an **image-embedding index**.
+2. **Online:** a fine-tuned Qwen2-VL-7B encodes (reference image + text) → a 512-d
+   query vector **directly** (no caption step).
+3. **Cosine similarity search** against the index → Top-K.
+&nbsp;·&nbsp; R@10 = 0.402
+
+### 🅿️3 — Text two-tower
+1. **Offline:** the **target tower** encodes every gallery image → store a
+   **target-embedding index** (this tower is trained, not a frozen encoder).
+2. **Online:** the **query tower** encodes (reference image + text modification)
+   → 512-d query vector, in the same space as the index.
+3. **Cosine similarity search** → Top-K.
+&nbsp;·&nbsp; R@10 = 0.654 — best text result
+
+### 🅿️4 — Audio two-tower
+1. **Offline:** the same target tower encodes every gallery image → target index.
+2. **Online:** the query tower takes (reference image + **raw speech**); the audio
+   passes through the model's Whisper encoder **with no speech-to-text** → 512-d
+   query vector.
+3. **Cosine similarity search** → Top-K.
+&nbsp;·&nbsp; R@10 = 0.624 / 0.643
+
+---
+**🎬 Demo** runs all four query encoders on the **same** reference + modification
+and searches each one's index, so you can see which pipeline's Top-1 is the true
+target (✓).
+"""
+
+_V2_CSS = """
+.v2-glyph{font-size:42px;font-weight:800;color:#9aa0a6;display:flex;
+  align-items:center;justify-content:center;min-height:260px;}
+.v2-cue{font-size:1.05rem;padding:6px 4px;}
+.v2-hero .label-wrap{font-weight:700;}
+.v2-howto p{font-size:1.15rem;line-height:1.55;}
+.v2-explain .label-wrap, .v2-explain .label-wrap span{font-size:1.2rem;font-weight:700;}
+/* Reference Image and Modification headings — same prominent style on both
+   columns so the content below them lines up at the same vertical position. */
+.v2-ref-title h3, .v2-mod-title h3{font-size:1.35rem; margin:2px 0 6px 0;}
+/* Modification text box: match the reference image box height so the two
+   columns are visually balanced. */
+#v2-mod-textbox textarea{min-height:220px !important;}
+/* Real, always-clickable upload button (dashed border so it reads as "drop zone"). */
+.v2-upload-btn{font-size:1rem !important; padding:12px !important;
+  border:2px dashed #4493f8 !important; margin-top:4px !important;}
+.v2-upload-btn:hover{background:#eff6fc !important;}
+/* Make the empty image area read as a clickable drop zone (gradio's native
+   click-to-upload works, but the empty state looks inert without a hover cue). */
+#v2-ref-img .empty, #v2-ref-img [class*="empty"]{cursor:pointer;}
+#v2-ref-img .empty:hover, #v2-ref-img [class*="empty"]:hover{background:#f6f8fa;}
+/* The gr.Group wrappers around the text/audio modification widgets shouldn't
+   render as visible gray-bordered boxes — they're only logical containers. */
+.v2-naked > div, .v2-naked > .form{border:none !important; padding:0 !important;
+  background:transparent !important; box-shadow:none !important;}
+"""
+
+
+def _v2_tag(pid: str) -> str:
+    """Circled-number tag for a preset (e.g. '③'), used as the pairing cue."""
+    i = PRESET_ORDER.index(pid)
+    return _V2_CIRCLED[i] if i < len(_V2_CIRCLED) else f"#{i + 1}"
+
+
+def _v2_inputs(sel):
+    """(reference image path, modification text, audio path) for one example."""
+    if not sel or sel not in PRESETS:
+        return None, "", None
+    p = PRESETS[sel]
+    img = str(gallery.image_path(p["candidate_image_id"]))
+    w = config.PRESET_AUDIO_DIR / f"{sel}.wav"
+    aud = str(w) if w.exists() else None
+    return img, p["modification_text"], aud
+
+
+def _v2_run(sel, mode, k):
+    """Compute results for the loaded example, in order (11 values):
+      top1_image, top1_badge, topk_items,
+      demo_strip_items (the 4-thumb top-1 comparison shown in the equation row),
+      demo_p1_items, demo_p2_items, demo_p3_items, demo_p4_items (full Top-K rows),
+      gt_image, gt_label, status
+    """
+    if not sel or sel not in PRESETS:
+        return (None, "", [], [], [], [], [], [], None, "_—_",
+                "👉 Click an example on the right, then press **▶ Run**.")
+
+    preset = PRESETS[sel]
+    tt = preset.get("true_target_id")
+    k = int(k)
+
+    def rank_str(rank):
+        return f"#{rank}" if rank else "not in top-50"
+
+    # Single-mode top-1 + full Top-K for the selected pipeline.
+    r = _result_from_cached(preset[_V2_MODES.get(mode, "audio2t")], tt)
+    top1_id = r.target_ids[0] if r.target_ids else None
+    top1_img = str(gallery.image_path(top1_id)) if top1_id else None
+    hit = top1_id == tt
+    top1_badge = (
+        f"## {'✅ Correct!' if hit else '❌ Top-1 is not the target'}\n"
+        f"true target ranked **{rank_str(r.true_target_rank)}**"
+        if top1_id else "_no result_"
+    )
+    topk_items = _gallery_items(r, k)
+
+    # Demo strip (quick at-a-glance): each pipeline's top-1 in one comparison.
+    demo_strip = []
+    demo_lists = []
+    for label, key in _V2_MODES.items():
+        rr = _result_from_cached(preset[key], tt)
+        t1 = rr.target_ids[0] if rr.target_ids else None
+        mark = "✓ correct" if t1 == tt else "✗"
+        demo_strip.append((str(gallery.image_path(t1)),
+                           f"{_V2_SHORT[label]}  {mark}  (true {rank_str(rr.true_target_rank)})"))
+        # Full Top-K for that pipeline.
+        items = []
+        for i, t in enumerate(rr.target_ids[:k]):
+            star = " ★" if t == tt else ""
+            items.append((str(gallery.image_path(t)), f"#{i + 1}  {t}{star}"))
+        demo_lists.append(items)
+
+    gt = str(gallery.image_path(tt)) if tt else None
+    gt_label = f"✅ **Correct answer:** `{tt}`"
+    title = PRESET_NARRATIVES.get(sel, {}).get("title", "")
+    if mode == _V2_DEMO:
+        status = f"Showing **{title}** — all four models' Top-K compared below."
+    else:
+        status = f"Showing **{title}** — model **{mode.split(' — ')[0]}**."
+    return (top1_img, top1_badge, topk_items, demo_strip,
+            demo_lists[0], demo_lists[1], demo_lists[2], demo_lists[3],
+            gt, gt_label, status)
+
+
+def _v2_run_live(sel, audio_path, k):
+    """Run the Plan-15 audio two-tower LIVE on the user's recorded/loaded clip
+    (P4 mode). Reference garment = the selected example's candidate image. Returns
+    the same 10-tuple shape as _v2_run (4 demo rows empty for single-mode view)."""
+    from .pipelines.two_tower import run_two_tower_inference
+    from .precompute_presets import find_rank, load_candidate_image
+
+    preset = PRESETS[sel]
+    tt = preset.get("true_target_id")
+    image = load_candidate_image(preset["candidate_image_id"])
+    g_emb, g_ids = _AUDIO_GALLERY
+    ids, scores, lat = run_two_tower_inference(
+        _AUDIO_MODEL, config.LIVE_AUDIO_DEVICE, g_emb, g_ids,
+        image, audio_path, k=config.K_MAX,
+    )
+    k = int(k)
+    rank = find_rank(tt, ids)
+    rstr = f"#{rank}" if rank else "not in top-50"
+    top1_id = ids[0] if ids else None
+    top1_img = str(gallery.image_path(top1_id)) if top1_id else None
+    hit = top1_id == tt
+    badge = (f"## {'✅ Correct!' if hit else '❌ Top-1 is not the target'}\n"
+             f"🎙 **LIVE P4 on your audio** · true target ranked **{rstr}** · "
+             f"embed {lat['embed_s']:.2f}s")
+    topk_items = []
+    for i, t in enumerate(ids[:k]):
+        mark = " ★" if t == tt else ""
+        topk_items.append((str(gallery.image_path(t)),
+                           f"#{i + 1}  {t}{mark}  ({scores[i]:.2f})"))
+    gt = str(gallery.image_path(tt)) if tt else None
+    gt_label = f"✅ **Correct answer:** `{tt}`"
+    title = PRESET_NARRATIVES.get(sel, {}).get("title", "")
+    status = (f"🎙 Ran **P4 audio two-tower LIVE** on your clip "
+              f"(reference garment: {title}).")
+    return (top1_img, badge, topk_items, [], [], [], [], [], gt, gt_label, status)
+
+
+def _v2_visibility(mode):
+    """Visibility for the chosen mode, in order:
+    (v2_mod_text, v2_aud, single_group, demo_group, topk_group,
+     text_prompts_group, voice_clips_group, demo_topk_group).
+
+    Modality-matched: text models (P1/P2/P3) show the typed text + text-prompt
+    buttons; the audio model (P4) shows the spoken clip (recordable, run live) +
+    voice-clip buttons; 🎬 Demo shows both. Single modes get the single Top-K
+    list; Demo gets the four-pipeline Top-K rows. Visibility is toggled on the
+    components directly so no empty gray container is left behind.
+    """
+    is_demo = mode == _V2_DEMO
+    is_audio = mode == "P4 — Audio two-tower"
+    show_text = (not is_audio) or is_demo
+    show_audio = is_audio or is_demo
+    single = not is_demo
+    return (gr.update(visible=show_text),    # v2_mod_text (left)
+            gr.update(visible=show_audio),   # v2_aud (left)
+            gr.update(visible=single),       # single_group (result)
+            gr.update(visible=is_demo),      # demo_group (top-1 strip in eq row)
+            gr.update(visible=single),       # topk_group (single's full Top-K)
+            gr.update(visible=show_text),    # text_prompts_group (right)
+            gr.update(visible=show_audio),   # voice_clips_group (right)
+            gr.update(visible=is_demo))      # demo_topk_group (4 ranked rows)
+
+
+def build_ui_v2() -> gr.Blocks:
+    """v2 demo — the A+B=C equation view, simplified.
+
+    One click on an example (right panel) loads its reference image + modification
+    (text & spoken) AND runs the selected model, so the answer appears next to the
+    query with no scrolling and no separate "match the number" step. A ▶ Run
+    button re-runs; Clear resets. Preset-only (cached, no GPU); uploading your own
+    image is accepted but its live retrieval is not wired yet.
+
+    A separate Blocks so v1 (`build_ui`) is never touched; the two are combined
+    into switchable tabs by `main()` via gr.TabbedInterface.
+    """
+    with gr.Blocks(title="Fashion Retrieval — v2", css=_V2_CSS) as demo:
+        gr.HTML(f"<style>{_V2_CSS}</style>")  # robust inject under TabbedInterface
+        gr.Markdown(
+            "# 👗 Find the matching garment\n"
+            "**How to use:** click an **example** in the panel on the right — it "
+            "instantly loads a **reference image ➕ a modification** (typed for the "
+            "text models, spoken for the audio model) and shows the model's "
+            "**🟰 matching garment**. Switch models below, or **🎬 Demo** to compare "
+            "all four at once. _(In **P4** mode you can **🎙 record your own voice** "
+            "and Run it live; uploading your own image is coming soon.)_",
+            elem_classes=["v2-howto"],
+        )
+
+        sel = gr.State(None)        # the loaded example's preset id
+
+        v2_mode = gr.Radio(
+            _V2_MODE_CHOICES, value=_V2_DEMO,
+            label="Model (pick one) — or 🎬 Demo to compare all four",
+        )
+
+        with gr.Accordion("❓ What does each pipeline (P1–P4) mean?  ▸ click to expand",
+                          open=False, elem_classes=["v2-explain"]):
+            gr.Markdown(_V2_PIPELINE_EXPLAINER)
+
+        with gr.Row():
+            # ===================== LEFT: the equation =====================
+            with gr.Column(scale=3):
+                # ---- query: REFERENCE + MODIFICATION ----
+                with gr.Row(elem_classes=["v2-hero"], equal_height=True):
+                    with gr.Column(scale=6):
+                        gr.Markdown("### 🖼 Reference Image",
+                                    elem_classes=["v2-ref-title"])
+                        v2_img = gr.Image(
+                            label="", show_label=False,
+                            sources=["upload"], type="filepath", height=220,
+                            elem_id="v2-ref-img",
+                        )
+                        v2_upload_btn = gr.UploadButton(
+                            "➕  Click to upload your own image",
+                            file_types=["image"], type="filepath",
+                            elem_classes=["v2-upload-btn"],
+                        )
+                        with gr.Accordion(
+                            "⚠ Preset-only demo warning  ▸ click to expand",
+                            open=False,
+                        ):
+                            gr.Markdown(
+                                "**No inference server is deployed for the image-text "
+                                "models** (P1 / P2 / P3, plus the image side of P4) — "
+                                "so **uploading a custom image** (or typing custom "
+                                "text in the modification box) **won't return "
+                                "retrieval results here**. The upload path is "
+                                "intentionally left in: clone the repo and deploy "
+                                "the two-tower / caption pipeline yourself to enable "
+                                "it."
+                            )
+                    with gr.Column(scale=1, min_width=40):
+                        gr.HTML("<div class='v2-glyph'>+</div>")
+                    with gr.Column(scale=6):
+                        gr.Markdown("### 📝 Modification — what should change",
+                                    elem_classes=["v2-mod-title"])
+                        v2_mod_text = gr.Textbox(
+                            label="📝 as text — read by P1 / P2 / P3  "
+                                  "(type your own, or pick a prompt on the right)",
+                            lines=9, interactive=True, visible=True,
+                            elem_id="v2-mod-textbox",
+                            placeholder="Type how the garment should change… "
+                                        "(custom text needs a deployed inference "
+                                        "server — see ⚠ warning under the image)",
+                        )
+                        v2_aud = gr.Audio(
+                            label="🔊 as speech — heard by P4 · ▶ to play, or "
+                                  "🎙 record your own (P4 ▶ Run = live retrieval)",
+                            sources=["microphone", "upload"], type="filepath",
+                            visible=True,
+                        )
+
+                # ---- the Run / Clear actions ----
+                with gr.Row():
+                    v2_run_btn = gr.Button("▶ Run", variant="primary",
+                                           size="lg", scale=3)
+                    v2_clear_btn = gr.Button("✖ Clear", size="lg", scale=1)
+
+                gr.HTML("<div class='v2-glyph'>=</div>")
+
+                # ---- answer: model result + ground truth, side by side ----
+                with gr.Row(equal_height=True):
+                    with gr.Column(scale=6):
+                        with gr.Group(visible=False) as single_group:
+                            v2_top1 = gr.Image(label="🎯 MODEL'S TOP-1", type="filepath",
+                                               interactive=False, height=210)
+                            v2_top1_badge = gr.Markdown()
+                        with gr.Group(visible=True) as demo_group:
+                            v2_demo_gallery = gr.Gallery(
+                                label="🎯 ALL FOUR models' top-1 (✓ = found the target)",
+                                columns=2, rows=2, height=230, object_fit="contain",
+                                allow_preview=True)
+                    with gr.Column(scale=6):
+                        v2_gt_img = gr.Image(label="✅ GROUND TRUTH (correct answer)",
+                                             type="filepath", interactive=False,
+                                             height=210)
+                        v2_gt_label = gr.Markdown("_run to reveal_")
+
+                v2_status = gr.Markdown(
+                    "👉 Click a **garment** or a **🔊 voice clip** on the right — it loads and runs instantly.",
+                    elem_classes=["v2-cue"],
+                )
+
+                # ---- K slider (always visible — used by single Top-K + Demo rows) ----
+                v2_k = gr.Slider(config.K_MIN, config.K_MAX,
+                                 value=config.K_DEFAULT, step=1,
+                                 label=f"Top-K (max {config.K_MAX})")
+
+                # ---- Top-K for the chosen single model ----
+                with gr.Group(visible=False) as topk_group:
+                    v2_topk = gr.Gallery(label="Full ranked list (left = best match)",
+                                         columns=10, rows=2, height=300,
+                                         object_fit="contain", allow_preview=True)
+
+                # ---- Demo mode: Top-K stacked per pipeline ----
+                with gr.Group(visible=True) as demo_topk_group:
+                    gr.Markdown("### 📊 Top-K per pipeline (same query, four rankings)")
+                    gr.Markdown("**P1 — Caption baseline**")
+                    v2_demo_p1 = gr.Gallery(label="", columns=10, rows=1,
+                                            height=120, object_fit="contain",
+                                            allow_preview=True)
+                    gr.Markdown("**P2 — Direct embedding**")
+                    v2_demo_p2 = gr.Gallery(label="", columns=10, rows=1,
+                                            height=120, object_fit="contain",
+                                            allow_preview=True)
+                    gr.Markdown("**P3 — Text two-tower**")
+                    v2_demo_p3 = gr.Gallery(label="", columns=10, rows=1,
+                                            height=120, object_fit="contain",
+                                            allow_preview=True)
+                    gr.Markdown("**P4 — Audio two-tower**")
+                    v2_demo_p4 = gr.Gallery(label="", columns=10, rows=1,
+                                            height=120, object_fit="contain",
+                                            allow_preview=True)
+
+            # ================ RIGHT: the examples panel ================
+            with gr.Column(scale=1, min_width=240):
+                gr.Markdown(
+                    "### 📋 Examples\nPick by **garment** (click a photo) — or by "
+                    "its **text prompt** / **voice clip** below (the picker matches "
+                    "the model you selected). Any click loads the matching example "
+                    "and runs instantly."
+                )
+                v2_examples = gr.Gallery(
+                    value=[(str(gallery.image_path(PRESETS[pid]["candidate_image_id"])),
+                            f"{i + 1}. {PRESET_NARRATIVES.get(pid, {}).get('title', '')}")
+                           for i, pid in enumerate(PRESET_ORDER)],
+                    label="🖼 Garments — click a photo", columns=2, rows=4,
+                    height=340, allow_preview=False, object_fit="cover",
+                )
+                # Text-prompt picker (text models P1/P2/P3 + Demo).
+                with gr.Group(visible=True) as text_prompts_group:
+                    gr.Markdown("**📝 …or pick a text prompt:**")
+                    v2_text_btns = [
+                        (pid, gr.Button(
+                            f"📝 {i + 1}. {PRESETS[pid]['modification_text'][:60]}"
+                            + ("…" if len(PRESETS[pid]['modification_text']) > 60 else ""),
+                            size="sm"))
+                        for i, pid in enumerate(PRESET_ORDER)
+                    ]
+                # Voice-clip picker (audio model P4 + Demo).
+                with gr.Group(visible=True) as voice_clips_group:
+                    gr.Markdown("**🔊 …or pick a voice clip:**")
+                    v2_voice_btns = [
+                        (pid, gr.Button(
+                            f"🔊 {i + 1}. {PRESET_NARRATIVES.get(pid, {}).get('title', '')}",
+                            size="sm"))
+                        for i, pid in enumerate(PRESET_ORDER)
+                    ]
+
+        # ----- wiring -----
+        run_out = [v2_top1, v2_top1_badge, v2_topk, v2_demo_gallery,
+                   v2_demo_p1, v2_demo_p2, v2_demo_p3, v2_demo_p4,
+                   v2_gt_img, v2_gt_label, v2_status]
+        vis_out = [v2_mod_text, v2_aud, single_group, demo_group,
+                   topk_group, text_prompts_group, voice_clips_group,
+                   demo_topk_group]
+
+        # Selecting an example (by photo OR by voice clip) loads its reference
+        # image + both modification forms AND runs — never a mismatch.
+        select_out = [sel, v2_img, v2_mod_text, v2_aud, *run_out]
+
+        def _select(pid, mode, k):
+            img, text, aud = _v2_inputs(pid)
+            return (pid, img, text, aud, *_v2_run(pid, mode, k))
+
+        def on_example(mode, k, evt: gr.SelectData):
+            pid = PRESET_ORDER[evt.index]
+            if mode == _V2_DEMO:
+                # Demo: full auto-load (image + text + audio) and run all four.
+                return _select(pid, mode, k)
+            # Single modes: load only the reference image — the user provides the
+            # modification (type text, or record audio in P4, or click a prompt /
+            # voice clip on the right). Results stay cleared until they Run.
+            img, _text, _aud = _v2_inputs(pid)
+            if mode == "P4 — Audio two-tower":
+                hint = (f"🖼 Reference loaded. **🎙 Record your audio** (or click "
+                        f"a 🔊 voice clip on the right), then press **▶ Run**.")
+            else:
+                hint = (f"🖼 Reference loaded. **Type your modification** in the 📝 "
+                        f"box (or click a 📝 prompt on the right), then press "
+                        f"**▶ Run**.")
+            # 15 outputs = sel + v2_img + v2_mod_text + v2_aud + 11 run_out
+            return (pid, img, "", None,
+                    None, "", [], [], [], [], [], [],
+                    None, "_run to reveal_", hint)
+
+        v2_examples.select(fn=on_example, inputs=[v2_mode, v2_k], outputs=select_out)
+        for pid, b in v2_voice_btns:
+            b.click(fn=lambda mode, k, pid=pid: _select(pid, mode, k),
+                    inputs=[v2_mode, v2_k], outputs=select_out)
+        for pid, b in v2_text_btns:
+            b.click(fn=lambda mode, k, pid=pid: _select(pid, mode, k),
+                    inputs=[v2_mode, v2_k], outputs=select_out)
+
+        # Typing custom text and pressing Enter: honest "needs deploy" message
+        # (no inference server for the text pipelines in this preset-only build).
+        def on_custom_text():
+            msg = ("🛈 Custom text received — but no inference server is deployed "
+                   "for the text pipelines (see **⚠ Preset-only demo warning** "
+                   "under the image). Click a 📝 prompt on the right to see real "
+                   "cached results.")
+            return (None, None, None,
+                    None, "", [], [], [], [], [], [],
+                    None, "_run to reveal_", msg)
+
+        v2_mod_text.submit(
+            fn=on_custom_text, inputs=None,
+            outputs=[sel, v2_img, v2_aud,
+                     v2_top1, v2_top1_badge, v2_topk, v2_demo_gallery,
+                     v2_demo_p1, v2_demo_p2, v2_demo_p3, v2_demo_p4,
+                     v2_gt_img, v2_gt_label, v2_status],
+        )
+
+        # ▶ Run: P4 runs the audio two-tower LIVE on the current clip (your
+        # recording or the loaded preset); everything else reads the cache.
+        def on_run(cur_sel, mode, k, audio_path):
+            if (mode == "P4 — Audio two-tower" and _AUDIO_MODEL is not None
+                    and audio_path and cur_sel in PRESETS):
+                return _v2_run_live(cur_sel, audio_path, k)
+            return _v2_run(cur_sel, mode, k)
+
+        v2_run_btn.click(
+            fn=on_run, inputs=[sel, v2_mode, v2_k, v2_aud], outputs=run_out,
+        )
+        v2_k.release(
+            fn=on_run, inputs=[sel, v2_mode, v2_k, v2_aud], outputs=run_out,
+        )
+
+        def on_mode(mode, cur_sel, k):
+            return (*_v2_visibility(mode), *_v2_run(cur_sel, mode, k))
+
+        v2_mode.change(
+            fn=on_mode, inputs=[v2_mode, sel, v2_k],
+            outputs=[*vis_out, *run_out],
+        )
+
+        def on_clear():
+            return (None, None, "", None,
+                    None, "", [], [], [], [], [], [],
+                    None, "_run to reveal_",
+                    "👉 Click a **garment** or a **🔊 voice clip** on the right — it loads and runs instantly.")
+
+        v2_clear_btn.click(
+            fn=on_clear, inputs=None,
+            outputs=[sel, v2_img, v2_mod_text, v2_aud,
+                     v2_top1, v2_top1_badge, v2_topk, v2_demo_gallery,
+                     v2_demo_p1, v2_demo_p2, v2_demo_p3, v2_demo_p4,
+                     v2_gt_img, v2_gt_label, v2_status],
+        )
+
+        # Custom image upload: honest "not wired yet" (preset-only build).
+        def on_custom_image():
+            msg = ("🛈 Custom image received — but no inference server is deployed "
+                   "(see **⚠ Preset-only demo warning** under the image). Click an "
+                   "example on the right to see real cached results.")
+            # Clear the old preset's modification too, so the custom image isn't
+            # shown next to a stale text/audio modification.
+            return (None, msg, "", None,
+                    None, "", [], [], [], [], [], [],
+                    None, "_run to reveal_")
+
+        v2_img.upload(
+            fn=on_custom_image, inputs=None,
+            outputs=[sel, v2_status, v2_mod_text, v2_aud,
+                     v2_top1, v2_top1_badge, v2_topk, v2_demo_gallery,
+                     v2_demo_p1, v2_demo_p2, v2_demo_p3, v2_demo_p4,
+                     v2_gt_img, v2_gt_label],
+        )
+
+        # Real click-to-upload entry point (the gr.Image's native empty area
+        # isn't always reliably clickable; this is the guaranteed-clickable one).
+        def on_upload(path):
+            msg = ("🛈 Custom image received — but no inference server is deployed "
+                   "(see **⚠ Preset-only demo warning** under the image). Click "
+                   "an example on the right to see real cached results.")
+            return (None, path, msg, "", None,
+                    None, "", [], [], [], [], [], [],
+                    None, "_run to reveal_")
+
+        v2_upload_btn.upload(
+            fn=on_upload, inputs=v2_upload_btn,
+            outputs=[sel, v2_img, v2_status, v2_mod_text, v2_aud,
+                     v2_top1, v2_top1_badge, v2_topk, v2_demo_gallery,
+                     v2_demo_p1, v2_demo_p2, v2_demo_p3, v2_demo_p4,
+                     v2_gt_img, v2_gt_label],
+        )
+
+        # Make the entire empty Reference Image box click-to-upload (gradio's
+        # native empty area only treats the small inner icon as a click target,
+        # which is why clicking the box itself appeared to do nothing). This JS
+        # routes any click on the empty box through the UploadButton's hidden
+        # file input, so hovering + clicking the box now opens the file dialog
+        # exactly like the dashed button beneath it.
+        demo.load(
+            fn=lambda: None, inputs=None, outputs=None,
+            js="""() => {
+  // Document-level capture-phase delegation so gradio's own click handlers
+  // can't swallow the event before we intercept. When the user clicks the empty
+  // Reference Image box, we fire the UploadButton's file input (which is the
+  // SAME path as the visible '➕ Click to upload' button — guaranteed to work).
+  if (window.__v2_img_click_wired) return;
+  window.__v2_img_click_wired = true;
+  document.addEventListener('click', function(e) {
+    const imgBox = e.target.closest('#v2-ref-img');
+    if (!imgBox) return;
+    if (imgBox.querySelector('img')) return;  // image already loaded — leave it
+    // Find the UploadButton's hidden file input.
+    let fi = null;
+    const ub = document.querySelector('.v2-upload-btn');
+    if (ub) {
+      fi = ub.querySelector('input[type=file]');
+      if (!fi && ub.parentElement) fi = ub.parentElement.querySelector('input[type=file]');
+    }
+    if (!fi) {
+      // last-ditch: any file input on the page
+      const all = document.querySelectorAll('input[type=file]');
+      for (const inp of all) {
+        if (inp.closest('.v2-upload-btn')) { fi = inp; break; }
+      }
+      if (!fi && all.length) fi = all[0];
+    }
+    if (fi) {
+      e.preventDefault();
+      e.stopPropagation();
+      fi.click();
+    }
+  }, true);
+}"""
+        )
+
+    return demo
+
+
 def main() -> None:
     # Load the audio two-tower before launch so the first live click is fast
     # (and so a missing checkpoint fails loudly at startup, not mid-demo).
     if config.LIVE_AUDIO:
         load_audio_tower()
 
-    demo = build_ui()
+    # v1 and v2 are independent Blocks; TabbedInterface presents them as two
+    # switchable pages. v1 is preserved verbatim — it remains the fallback until
+    # v2 fully replaces it.
+    # v2 is the default tab (shown first on load); v1 stays as the stable backup.
+    app = gr.TabbedInterface(
+        [build_ui_v2(), build_ui()],
+        ["✨ v2 (new)", "📦 v1 (stable)"],
+        title="👗 Fashion Retrieval",
+    )
+
     # allowed_paths: gradio 6.x sandboxes file serving to cwd + /tmp by default.
     # We need to whitelist the gallery + preset thumbs + preset audio so the
     # Image / Gallery / Audio components can serve files from those paths.
@@ -650,12 +1266,11 @@ def main() -> None:
         str(config.PRESET_CACHE_JSON.parent),
         str(config.PRESET_AUDIO_DIR),
     ]
-    demo.queue(default_concurrency_limit=1).launch(
+    app.queue(default_concurrency_limit=1).launch(
         server_name="0.0.0.0",
         server_port=config.GRADIO_SERVER_PORT,
         share=config.GRADIO_SHARE,
         allowed_paths=allowed,
-        theme=gr.themes.Soft(),
     )
 
 
