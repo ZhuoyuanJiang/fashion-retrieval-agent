@@ -1,10 +1,33 @@
 # fashion-retrieval-agent
 
-Research workspace for an audio-conditioned composed fashion retrieval system:
-given a reference garment image and a spoken modification request (e.g. "make
-it black", "shorter sleeves"), retrieve the matching item from a fashion
-catalog. The current focus is dataset exploration and method scoping; see
+**Audio-conditioned composed fashion retrieval.** Given a reference garment
+image and a spoken modification request (e.g. "make it black", "shorter
+sleeves"), retrieve the matching item from a fashion catalog. See
 `Documentation/` for proposals, plans, and progress logs.
+
+---
+
+## Table of Contents
+
+- [Project motivation](#project-motivation) — what the system does and why
+- [Demo](#demo) — run the Gradio app locally
+- [Headline result](#headline-result)
+- [Pipeline comparison](#pipeline-comparison) — the retrieval pipelines across 3 architecture families
+- [Architecture](#architecture) — two-tower joint embedding
+- [Results](#results) — headline table + encoder & caption ablations
+- [Recipes](#recipes) — exact commands to reproduce each pipeline
+- [Data generation](#data-generation) — FACap triplets → TTS spoken modifications
+- [Setup](#setup-only-when-replicating-on-a-fresh-machine) — fresh-machine replication
+- [Data-fetching helpers](#data-fetching-helpers)
+- [Full image downloads](#full-image-downloads-training-time)
+- [Baseline pipeline](#baseline-pipeline-src) — `src/` overview
+- [Running the baseline](#running-the-baseline)
+- [Real VLM baseline on a server](#real-vlm-baseline-on-a-server)
+- [Phase B: Contrastive training](#phase-b-contrastive-training-plans-510)
+- [Documentation index](#documentation-index)
+- [Repo structure](#repo-structure)
+- [Acknowledgments](#acknowledgments)
+- [Licenses](#licenses)
 
 ---
 
@@ -42,11 +65,15 @@ Demo source: [`src/demo/app.py`](src/demo/app.py).
 
 ## Headline result
 
-| FACap dress, 1,000-query held-out, 59,048-item gallery |
-|---|
-| **R@10 = 0.637** &nbsp;·&nbsp; +10.4 pp over Marqo-FashionCLIP (0.533) &nbsp;·&nbsp; +5.1 pp over Qwen3-Embedding-8B (0.586) &nbsp;·&nbsp; +165 % over the MiniLM caption baseline (0.240) |
+| FACap dress · 1,000-query held-out · 59,048-item gallery | R@10 |
+|---|:---:|
+| **Two-tower, typed modification** — best | **0.654** |
+| **Two-tower, native spoken modification** — flagship (audio in, no ASR) | **0.624** |
+| Caption + Qwen3-Embedding-8B — best caption baseline | 0.586 |
+| Caption + Marqo-FashionCLIP — best fashion baseline | 0.533 |
+| Caption + MiniLM-L6 — anchor baseline | 0.240 |
 
-<sub>Numbers are mid-run on Plan-10 V1 (Option B) at epoch ~11 of 18; final pending.</sub>
+<sub>The two-tower lifts R@10 **+12.1 pp** over [Marqo-FashionCLIP](https://huggingface.co/Marqo/marqo-fashionCLIP) (2024) — a leading fashion-domain CLIP embedder, near the top of [Marqo's public fashion-retrieval leaderboard](https://github.com/marqo-ai/marqo-FashionCLIP/blob/main/LEADERBOARD.md) (last updated 2024-08) — and **+6.8 pp** over Qwen3-Embedding-8B. Swapping the typed modification for TTS-synthesized speech — entering natively through speechQwen2VL's Whisper encoder, no ASR step — costs only ~0.03 R@10, so the audio-native query is competitive with text. (Best-checkpoint, FACap dress slice.)</sub>
 
 **Jump to:**
 [Pipelines](#pipeline-comparison) ·
@@ -71,9 +98,9 @@ Seven retrieval pipelines were designed, trained, and benchmarked across the pro
 | 2 | Caption + Marqo-FashionCLIP (Phase-A best, v1 concise) | text caption | FashionCLIP (frozen) | ✗ | 0.533 | strong fashion baseline |
 | 3 | Caption + Qwen3-Embedding-8B (Plan-9 v2 detailed) | detailed VLM caption | Qwen3-Embedding-8B (frozen) | ✗ | 0.586 | strong general baseline |
 | 4 | Qwen2VL → frozen FashionCLIP alignment (Plan-6) | (image, text) | FashionCLIP image (frozen) | query only | 0.402 | first contrastive attempt |
-| 5 | **Two-tower Qwen2VL — separate backbones (Plan-10 V1 Option B)** | (image, text) | Qwen2VL (trainable) | **both** | **0.637** | **current best, mid-run** |
-| 6 | Two-tower Qwen2VL — shared backbone + 2 LoRA adapters (Plan-10 V1 Option A) | (image, text) | Qwen2VL (trainable) | both | TBD | 🟡 in progress |
-| 7 | **Two-tower Qwen2VL + native audio query (Plan-10 V4 audio extension)** | **(image, audio)** | Qwen2VL (trainable) | both | TBD | **audio-native variant of Pipeline 6** 🎙️ |
+| 5 | Two-tower Qwen2VL — separate backbones (Plan-10 Option B) | (image, text) | Qwen2VL (trainable) | both | 0.637 | separate-backbone, final |
+| 6 | **Two-tower Qwen2VL — shared backbone + 2 LoRA adapters (Plan-10 → 13)** | (image, text) | Qwen2VL (trainable) | **both** | **0.654** | **best (text)** |
+| 7 | **Two-tower Qwen2VL + native audio query (Plan-15)** | **(image, audio)** | Qwen2VL (trainable) | **both** | **0.624** | **flagship — audio-native, competitive with text** 🎙️ |
 
 **The key insight (4 → 5):** replacing a frozen target encoder with a **co-trained** target tower lets the embedding space be **constructed end-to-end** by both towers rather than inherited from a frozen teacher — improving R@10 from 0.402 to 0.637 (+58.5 % relative) on the same data.
 
@@ -268,8 +295,9 @@ The same architecture is **audio-extensible** because the backbone (speechQwen2V
 | Caption + Marqo-FashionCLIP (v1 concise) | 0.258 | 0.456 | 0.533 | 0.685 |
 | Caption + Qwen3-Embedding-8B (v2 detailed) | 0.290 | — | 0.586 | 0.710 |
 | Qwen2VL → frozen FashionCLIP (Plan-6) | — | — | 0.402 | 0.646 |
-| **Two-tower Qwen2VL (Plan-10 V1 Option B, ep ~11)** | **0.222** | **0.522** | **0.637** | **0.842** |
-| Two-tower Qwen2VL (Plan-10 V1 Option A) | TBD | TBD | TBD | TBD |
+| Two-tower Qwen2VL — separate backbone (Plan-10 Option B) | 0.222 | 0.522 | 0.637 | 0.842 |
+| **Two-tower Qwen2VL — shared backbone (Plan-13, bs=24)** | **0.231** | **0.528** | **0.654** | **0.866** |
+| **Two-tower Qwen2VL — native audio query (Plan-15)** 🎙️ | **0.210** | **0.522** | **0.624** | **0.853** |
 
 ### Encoder ablation (Phase A, 11 retrieval encoders)
 
@@ -339,7 +367,7 @@ First contrastive recipe. Query tower is a trainable Qwen2VL; target is the froz
 - **R@10**: 0.402 — **regressed** from the 0.533 Phase-A baseline
 - **Why it matters**: the regression revealed the ceiling — the query tower was capped at FashionCLIP's discrimination. Motivated Recipe 5.
 
-### Recipe 5 — Two-tower Qwen2VL, separate backbones (Plan-10 V1 Option B) ✅ current best
+### Recipe 5 — Two-tower Qwen2VL, separate backbones (Plan-10 Option B) ✅ final
 
 Both query and target are trainable Qwen2VL towers. Embedding space co-constructed during training instead of inherited from a frozen teacher.
 
@@ -347,19 +375,19 @@ Both query and target are trainable Qwen2VL towers. Embedding space co-construct
 - **Loss**: symmetric multi-positive InfoNCE with cross-GPU `all_gather`, dynamic database re-encoding at end of every epoch
 - **Code**: [`src/training/train_plan10.py`](src/training/train_plan10.py), [`src/training/two_tower_model.py`](src/training/two_tower_model.py) (`TwoTowerSeparateBackbones`)
 - **Launch**: `bash scripts/run_plan10.sh --arch separate`
-- **R@10**: **0.637** (mid-run, epoch ~11 of 18)
-- **Why it matters**: validates the project's core architectural hypothesis; +0.235 absolute R@10 vs Recipe 4, beats every Phase-A baseline.
+- **R@10**: **0.637** (peak, ckpt_epoch11)
+- **Why it matters**: validates the project's core architectural hypothesis; +0.235 absolute R@10 vs Recipe 4, beats every Phase-A baseline. The shared-backbone variant (Recipe 6) later edged ahead at a larger batch.
 
-### Recipe 6 — Two-tower Qwen2VL, shared backbone + 2 LoRA adapters (Plan-10 V1 Option A) 🟡 in progress
+### Recipe 6 — Two-tower Qwen2VL, shared backbone + 2 LoRA adapters (Plan-10 → 13) ✅ best (text)
 
-Same loss / data / eval as Recipe 5, but with **one shared Qwen2VL backbone** plus two PEFT LoRA adapters toggled via `set_adapter`. Trades 2× VRAM for adapter cross-talk risk.
+Same loss / data / eval as Recipe 5, but with **one shared Qwen2VL backbone** plus two PEFT LoRA adapters toggled via `set_adapter`. Trades adapter cross-talk risk for half the VRAM — which is what later lets the batch (and the score) grow.
 
-- **Mitigation**: gradient checkpointing disabled (PEFT footgun — checkpoint recompute reads the *current* `active_adapter` rather than the one active during forward), documented in [`Documentation/Progress_11_20260512.md`](Documentation/Progress_11_20260512.md).
+- **The PEFT gradient-checkpointing fix**: the first shared run (Plan-10 Option A) had to *disable* gradient checkpointing (PEFT footgun — checkpoint recompute reads the *current* `active_adapter` rather than the one active during forward; [`Progress_11`](Documentation/Progress_11_20260512.md)), forcing bs=4 → R@10 0.587. Plan-12 replaced it with a **PEFT-aware `context_fn`** that re-enables checkpointing safely → bs=8 (0.623), then bs=24 (Plan-13) → **R@10 0.654**, the project's best text result. Batch size, not architecture, drove ~74% of the earlier shared-vs-separate gap ([`Progress_12`](Documentation/Progress_12_20260513.md)).
 - **Code**: [`src/training/two_tower_model.py`](src/training/two_tower_model.py) (`TwoTowerSharedBackbone`)
-- **Launch**: `bash scripts/run_plan10.sh --arch shared`
-- **R@10**: TBD — currently training; status tracked in Progress_11.
+- **Launch**: `bash scripts/run_plan10.sh --arch shared --batch-size 24`
+- **R@10**: **0.654** (Plan-13, bs=24, best text checkpoint)
 
-### Recipe 7 — Two-tower Qwen2VL with native audio query (Plan-10 V4 audio extension) 🎙️
+### Recipe 7 — Two-tower Qwen2VL with native audio query (Plan-15) 🎙️ ✅ flagship
 
 Audio-native variant of Recipe 6. Same two-tower architecture; the modification channel on the query side is replaced by a spoken-modification audio waveform consumed directly by speechQwen2VL's audio encoder — no separate ASR step.
 
@@ -368,8 +396,48 @@ Audio-native variant of Recipe 6. Same two-tower architecture; the modification 
 - **Target tower**: identical to Recipe 6 — `(target image, "Describe this image in detail.")`
 - **Loss / training**: same symmetric multi-positive InfoNCE with cross-GPU `all_gather`, dynamic end-of-epoch gallery refresh
 - **Code**: extension of [`src/training/train_plan10.py`](src/training/train_plan10.py) with an audio collator
-- **R@10**: TBD (training pending) — expected to match Recipe 6 baseline at parity given identical backbone and training data, modality swap only
+- **R@10**: **0.624** (Plan-15, dev-selected checkpoint; 0.643 best-checkpoint) — only ~0.03 below the typed-modification Recipe 6, confirming the audio-native query is competitive with text. A 3-way sensitivity probe (real / no-audio / shuffled-audio) confirms the result is genuinely audio-driven. See [`Progress_15`](Documentation/Progress_15_20260518.md).
 - **Why it matters**: closes the loop on the Motivation section's "speak as you browse" promise — the trained two-tower system serves both typed and spoken modification queries with zero architectural change.
+
+---
+
+## Data generation
+
+The query-side **spoken modifications** are TTS-synthesized from the FACap
+dress-slice modification texts — there is no manually recorded speech in
+training. Audio enters the model natively through speechQwen2VL's Whisper
+encoder (no ASR step).
+
+Pipeline ([`src/data/build_tts_audio.py`](src/data/build_tts_audio.py)):
+
+1. **Source text** — FACap dress-train triplets (`reference image,
+   modification text, target image`); the modification string is the text to
+   voice.
+2. **Voice bank** — a VCTK reference bank of ~110 speakers (gender-balanced),
+   split into a ~100-speaker training pool + 10 held-out OOD speakers.
+   Chatterbox is a zero-shot voice clone, so each speaker's reference clip *is*
+   the voice.
+3. **Synthesis** — Chatterbox TTS renders every used triplet (train + dev +
+   headline) to a 16 kHz mono wav with a training-pool speaker; dev + headline
+   additionally get a held-out speaker for the separate OOD-voice eval
+   (~56,686 clips total).
+4. **Manifest** — `manifest.json` indexes every clip by FACap triplet index →
+   `{wav, speaker, split, gender, accent}`, under `in_dist` and `ood`
+   sub-dicts.
+
+Regenerate (needs VCTK extracted + a Chatterbox env):
+
+```bash
+python -m src.data.build_tts_audio bank                            # VCTK speaker bank + synthesis plan
+python -m src.data.build_tts_audio synth --shard 0 --num-shards 8  # one per GPU, resumable
+python -m src.data.build_tts_audio manifest                        # collate manifest.json
+```
+
+Inspect a sample of the synthesized audio in
+[`notebooks/audio_dataset_demo.ipynb`](notebooks/audio_dataset_demo.ipynb)
+(image + audio + Whisper transcript for 15 triplets). Full details — TTS engine
+selection, WER QC, and voice control — are in
+[`Documentation/Progress_14_20260515.md`](Documentation/Progress_14_20260515.md).
 
 ---
 
@@ -718,6 +786,12 @@ The full design and execution history lives in [`Documentation/`](Documentation/
 - `src/` — baseline implementation (Plan_2 M1–M3); entry point is `src/baseline/run_baseline.py`.
 - `tests/` — runnable test suite for M1–M3 (13 cases).
 - `runs/` — gitignored: caption DBs, metrics, qualitative dumps.
+
+## Acknowledgments
+
+Special thanks to **Nima Tajbakhsh** (Nvidia) for valuable technical guidance and feedback throughout this project.
+
+---
 
 ## Licenses
 
