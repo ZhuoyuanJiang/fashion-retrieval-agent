@@ -21,3 +21,9 @@ condaenv.*.requirements.txt
 .DS_Store
 .vscode/
 .idea/
+_artifacts/
+
+# Generated locally from user's own FACap images (see scripts/make_demo_thumbs.py).
+# The other demo_assets/ contents (preset_cache.json, preset_audio/, survey.jsonl)
+# ARE tracked.
+demo_assets/preset_thumbs/
