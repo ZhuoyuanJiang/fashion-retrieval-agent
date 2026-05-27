@@ -136,9 +136,20 @@ Open [http://localhost:7860](http://localhost:7860) and try it.
 
 ## Setup
 
-The steps below rebuild the dataset and venv layout on a new machine — a GPU
-server, a fresh laptop, etc. **Skip this section on the dev machine that
-already has these things.** Re-running is safe: each step is idempotent.
+You'll need this section if you want to **train, run eval, or re-execute the
+exploration notebook** — anything beyond just running the demo. (The demo path
+is covered by [§Quick Start](#-quick-start) above.)
+
+The steps below set up dataset annotations + a small extra venv on a new
+machine. **3 steps:**
+
+1. **Dataset annotations** — ~240 MB JSON from four public repos (no images).
+2. **Python venv** for the exploration notebook (a separate env from the main
+   `fashion_retrieval` one that Quick Start already set up).
+3. *(Optional)* ~30 sample images — only if you re-execute the notebook.
+
+**Skip this section on the dev machine that already has these things.**
+Re-running is safe: each step is idempotent.
 
 ### 1. Clone third-party dataset repos
 
@@ -164,11 +175,16 @@ data_exploration/venv/bin/pip install requests pillow jupyter ipykernel \
     tqdm matplotlib datasets
 ```
 
-### 3. (Optional) Recreate the small image samples used by the notebook
+### 3. (Optional) ~30 sample images for the exploration notebook
 
-`setup_datasets.sh` pulls annotations only. To match the dev machine exactly,
-also run the two helpers described below — together they pull ~30 thumbnails
-(<1 MB total). Skip if you don't need to re-execute the notebook.
+The [`data_exploration/dataset_inspection.ipynb`](data_exploration/dataset_inspection.ipynb)
+notebook — written **very early in the project, when we were first looking at
+what FACap/FashionIQ data actually contains** — renders a few example triplets
+inline. To re-execute it, you need ~30 thumbnails (<1 MB total), pulled by the
+two helpers in [§Data-fetching helpers](#data-fetching-helpers) below.
+
+**Skip this step if** you don't plan to re-run that exploration notebook (most
+readers won't). **The demo itself does not depend on these sample images.**
 
 ## Data-fetching helpers
 
