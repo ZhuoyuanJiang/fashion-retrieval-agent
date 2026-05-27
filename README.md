@@ -9,21 +9,31 @@ sleeves"), retrieve the matching item from a fashion catalog. See
 
 ## Table of Contents
 
+**🪧 Intro**
 - [Project motivation](#project-motivation) — what the system does and why
-- [Demo](#demo) — run the Gradio app locally
+- [Demo](#demo) — what the running app looks like
+- [Quick Start](#-quick-start) — 3-step path to the running demo
 - [Headline result](#headline-result)
-- [Pipeline comparison](#pipeline-comparison) — the retrieval pipelines across 3 architecture families
+
+**🔧 Install & data**
+- [Setup](#setup) — fresh-machine install (env + dataset repos)
+- [Data-fetching helpers](#data-fetching-helpers) — small sample images for the dataset notebook
+- [Full image downloads](#full-image-downloads-training-time) — FACap / FashionIQ / Fashion-200k catalogs
+- [Data generation](#data-generation) — FACap triplets → TTS spoken modifications
+
+**📐 Method, pipeline & architecture overviews**
+- [Pipeline comparison](#pipeline-comparison) — 7 retrieval pipelines across 3 architecture families
 - [Architecture](#architecture) — two-tower joint embedding
 - [Results](#results) — headline table + encoder & caption ablations
 - [Recipes](#recipes) — exact commands to reproduce each pipeline
-- [Data generation](#data-generation) — FACap triplets → TTS spoken modifications
-- [Setup](#setup-only-when-replicating-on-a-fresh-machine) — fresh-machine replication
-- [Data-fetching helpers](#data-fetching-helpers)
-- [Full image downloads](#full-image-downloads-training-time)
-- [Baseline pipeline](#baseline-pipeline-src) — `src/` overview
-- [Running the baseline](#running-the-baseline)
-- [Real VLM baseline on a server](#real-vlm-baseline-on-a-server)
-- [Phase B: Contrastive training](#phase-b-contrastive-training-plans-510)
+
+**🛠 Running & training**
+- [Baseline pipeline](#baseline-pipeline-src) — what each file in `src/` does
+- [Running the baseline](#running-the-baseline) — CPU smoke + unit tests
+- [Real VLM baseline on a server](#real-vlm-baseline-on-a-server) — single-GPU Qwen2VL caption baseline
+- [Phase B: Contrastive training](#phase-b-contrastive-training-plans-510) — multi-GPU contrastive training
+
+**📚 Meta**
 - [Documentation index](#documentation-index)
 - [Repo structure](#repo-structure)
 - [Acknowledgments](#acknowledgments)
@@ -50,28 +60,66 @@ Then the whole flow would be much more natural — and better suited to real-tim
 
 ## Demo
 
-<!-- TODO: replace placeholder with screenshot/gif once Plan-10 Option A finishes and the demo preset cache is rebuilt -->
-> **[ demo screenshot / gif placeholder — pending Plan-10 Option A convergence ]**
->
-> Side-by-side comparison of the three retrieval recipes (Phase-A caption + Marqo-FashionCLIP, Plan-6 query-only contrastive, Plan-10 two-tower co-trained) on curated FACap dress queries, with an audio-query slot as a v0.2 placeholder.
-
 ```bash
-bash scripts/run_demo.sh    # → opens http://localhost:7860
+bash scripts/run_demo.sh    # opens http://localhost:7860
 ```
 
-Demo source: [`src/demo/app.py`](src/demo/app.py).
+The Gradio app lets you pick a reference garment image and either **type or
+speak** a modification — *"make it black"*, *"shorter sleeves"*, *"something
+more formal"* — and returns the top-K matching items from the FACap dress
+catalog (59K items). Source: [`src/demo/app.py`](src/demo/app.py).
+
+> *(Screenshot/GIF in progress — try it locally in the meantime.)*
+
+---
+
+## 🚀 Quick Start
+
+**Requirements:** Python 3.10+, conda, NVIDIA GPU with ≥16 GB VRAM (the demo loads a frozen 7B speech-VLM + the LoRA adapters on top).
+
+Get the demo running in 3 steps. (Full fresh-machine setup with dataset
+fetching is in [§Setup](#setup); training any pipeline from scratch is in
+[§Recipes](#recipes).)
+
+### 1. Clone + create conda env
+
+```bash
+git clone https://github.com/ZhuoyuanJiang/fashion-retrieval-agent.git
+cd fashion-retrieval-agent
+bash scripts/setup_server.sh    # clones speechQwen2VL sibling + creates the fashion_retrieval conda env
+```
+
+### 2. Log in to HuggingFace
+
+The base model ([`DanJZY/Qwen2-VL-7B-Speech`](https://huggingface.co/DanJZY/Qwen2-VL-7B-Speech))
+and the trained two-tower
+([`DanJZY/audio-composed-fashion-item-retriever`](https://huggingface.co/DanJZY/audio-composed-fashion-item-retriever))
+download from HF on first use.
+
+```bash
+huggingface-cli login
+```
+
+### 3. Run the demo
+
+```bash
+conda activate fashion_retrieval
+bash scripts/run_demo.sh        # opens http://localhost:7860
+```
+
+Open [http://localhost:7860](http://localhost:7860) and try it.
 
 ---
 
 ## Headline result
 
-| FACap dress · 1,000-query held-out · 59,048-item gallery | R@10 |
-|---|:---:|
-| **Two-tower, typed modification** — best | **0.654** |
-| **Two-tower, native spoken modification** — flagship (audio in, no ASR) | **0.624** |
-| Caption + Qwen3-Embedding-8B — best caption baseline | 0.586 |
-| Caption + Marqo-FashionCLIP — best fashion baseline | 0.533 |
-| Caption + MiniLM-L6 — anchor baseline | 0.240 |
+| FACap dress · 1,000-query held-out · 59,048-item gallery | R@10 | R@50 |
+|---|:---:|:---:|
+| **Two-tower, typed modification** — best | **0.654** | **0.866** |
+| **Two-tower, native spoken modification** — flagship (audio in, no ASR) | **0.624** | **0.853** |
+| Caption + Qwen3-Embedding-8B — best caption baseline | 0.586 | 0.710 |
+| Caption + Marqo-FashionCLIP — best fashion baseline | 0.533 | 0.685 |
+| Caption + MiniLM-L6 — anchor baseline | 0.240 | 0.384 |
 
 <sub>The two-tower lifts R@10 **+12.1 pp** over [Marqo-FashionCLIP](https://huggingface.co/Marqo/marqo-fashionCLIP) (2024) — a leading fashion-domain CLIP embedder, near the top of [Marqo's public fashion-retrieval leaderboard](https://github.com/marqo-ai/marqo-FashionCLIP/blob/main/LEADERBOARD.md) (last updated 2024-08) — and **+6.8 pp** over Qwen3-Embedding-8B. Swapping the typed modification for TTS-synthesized speech — entering natively through speechQwen2VL's Whisper encoder, no ASR step — costs only ~0.03 R@10, so the audio-native query is competitive with text. (Best-checkpoint, FACap dress slice.)</sub>
 
@@ -83,6 +131,153 @@ Demo source: [`src/demo/app.py`](src/demo/app.py).
 [Phase B training](#phase-b-contrastive-training-plans-510) ·
 [Demo](#demo) ·
 [Docs](#documentation-index)
+
+---
+
+## Setup
+
+The steps below rebuild the dataset and venv layout on a new machine — a GPU
+server, a fresh laptop, etc. **Skip this section on the dev machine that
+already has these things.** Re-running is safe: each step is idempotent.
+
+### 1. Clone third-party dataset repos
+
+```bash
+bash scripts/setup_datasets.sh
+```
+
+Clones four public repos into `data_exploration/datasets/`. Total ~240 MB of
+text annotations, **no images**.
+
+| Local path | Source | Purpose |
+|---|---|---|
+| `fashion-iq/` | github.com/XiaoxiaoGuo/fashion-iq | FashionIQ captions, splits, starter code |
+| `fashion-iq-metadata/` | github.com/hongwang600/fashion-iq-metadata | ASIN → Amazon image URL mapping |
+| `facap-repo/` | github.com/fgxaos/facap-sigir25-gennext | All FACap triplet + image-caption JSONs |
+| `fashion-200k/` | github.com/xthan/fashion-200k | README only; images on HuggingFace mirror |
+
+### 2. Python venv
+
+```bash
+python3 -m venv data_exploration/venv
+data_exploration/venv/bin/pip install requests pillow jupyter ipykernel \
+    tqdm matplotlib datasets
+```
+
+### 3. (Optional) Recreate the small image samples used by the notebook
+
+`setup_datasets.sh` pulls annotations only. To match the dev machine exactly,
+also run the two helpers described below — together they pull ~30 thumbnails
+(<1 MB total). Skip if you don't need to re-execute the notebook.
+
+## Data-fetching helpers
+
+Two thin helpers materialize the small image samples used during dataset
+exploration. They're designed to run on demand; nothing else in the repo
+fetches images automatically.
+
+### FashionIQ image fetcher (inside the notebook)
+
+`data_exploration/dataset_inspection.ipynb` defines `fetch_image(asin, url, cat)`,
+which downloads one Amazon-hosted image by ASIN and caches it under
+`data_exploration/datasets/fashion-iq-images/<cat>/<asin>.jpg`. The notebook's
+sampling cell calls this in a loop to pull ~14 triplets across dress, shirt,
+and toptee.
+
+- **Input:** ASIN strings parsed from `cap.<cat>.<split>.json` triplets, joined
+  to URLs from `fashion-iq-metadata/image_url/asin2url.<cat>.txt`.
+- **Output:** `.jpg` files cached locally; PIL.Image objects in memory for
+  rendering.
+- **When to run:** open the notebook and execute cells top to bottom — the
+  helper is invoked automatically. Images already on disk are reused.
+- **Failure modes:** Amazon may return 404/403 for individual ASINs; the
+  helper logs and skips them rather than failing the whole batch.
+
+### FACap dress sample fetcher (standalone script)
+
+```bash
+data_exploration/venv/bin/python data_exploration/fetch_facap_sample.py
+```
+
+Streams the `Marqo/fashion200k` HuggingFace mirror (~3.47 GB total, but only
+the first ~300 records are pulled — about 5 MB over the wire) and saves any
+images that match the first FACap dress triplets into
+`data_exploration/datasets/facap-images/`. It also writes a manifest JSON
+(`dress_sample_manifest.json`) listing the matched triplets for the
+notebook's FACap rendering cell to consume.
+
+- **Input:** `data_exploration/datasets/facap-repo/data/facap/cir_triplets/dress_train_triplets.json`
+  + the streaming HuggingFace dataset.
+- **Output:** ~5 `.jpeg` files (~70 KB total) and a manifest JSON.
+- **When to run:** once after `setup_datasets.sh`, if you want the notebook's
+  FACap section to render real images. The notebook's text cells work without
+  these.
+- **Knobs:** `STREAM_N` (how many HF records to scan) and `MAX_MATCHES`
+  (how many triplets to keep) at the top of the script.
+
+## Full image downloads (training-time)
+
+The setup script and helpers above cover **annotations + small samples**, not
+the full image data needed for training. When the implementation phase
+starts, the following downloads need to be added (no script exists yet —
+TODO: `scripts/download_full_datasets.py`):
+
+1. **FashionIQ images** — full splits across dress / shirt / toptee (~57k images).
+   - Source: Amazon CDN URLs in `fashion-iq-metadata/image_url/asin2url.*.txt`.
+   - Estimated 5–10 GB.
+   - Risk: Amazon URL rot. URLs were alive in 2026 but the dataset was released
+     at ICCV 2019, so long-term entries may drop.
+
+2. **Fashion200k images** — needed for FACap pretraining.
+   - HuggingFace mirror: `huggingface.co/datasets/Marqo/fashion200k`.
+   - ~3.47 GB, ~200k images.
+   - Stream by `item_ID` (e.g. `51727804_0`); FACap triplets reference these
+     by paths like `f200k_images/dresses/.../51727804_0.jpeg`.
+
+3. **DeepFashion-MultiModal images** — auxiliary FACap source.
+   - HuggingFace mirror: `huggingface.co/datasets/Marqo/deepfashion-multimodal`.
+
+Defer until the training plan specifies which splits and categories are
+actually needed — pretraining all six FACap categories vs. starting with just
+dress changes the disk and bandwidth footprint significantly.
+
+## Data generation
+
+The query-side **spoken modifications** are TTS-synthesized from the FACap
+dress-slice modification texts — there is no manually recorded speech in
+training. Audio enters the model natively through speechQwen2VL's Whisper
+encoder (no ASR step).
+
+Pipeline ([`src/data/build_tts_audio.py`](src/data/build_tts_audio.py)):
+
+1. **Source text** — FACap dress-train triplets (`reference image,
+   modification text, target image`); the modification string is the text to
+   voice.
+2. **Voice bank** — a VCTK reference bank of ~110 speakers (gender-balanced),
+   split into a ~100-speaker training pool + 10 held-out OOD speakers.
+   Chatterbox is a zero-shot voice clone, so each speaker's reference clip *is*
+   the voice.
+3. **Synthesis** — Chatterbox TTS renders every used triplet (train + dev +
+   headline) to a 16 kHz mono wav with a training-pool speaker; dev + headline
+   additionally get a held-out speaker for the separate OOD-voice eval
+   (~56,686 clips total).
+4. **Manifest** — `manifest.json` indexes every clip by FACap triplet index →
+   `{wav, speaker, split, gender, accent}`, under `in_dist` and `ood`
+   sub-dicts.
+
+Regenerate (needs VCTK extracted + a Chatterbox env):
+
+```bash
+python -m src.data.build_tts_audio bank                            # VCTK speaker bank + synthesis plan
+python -m src.data.build_tts_audio synth --shard 0 --num-shards 8  # one per GPU, resumable
+python -m src.data.build_tts_audio manifest                        # collate manifest.json
+```
+
+Inspect a sample of the synthesized audio in
+[`notebooks/audio_dataset_demo.ipynb`](notebooks/audio_dataset_demo.ipynb)
+(image + audio + Whisper transcript for 15 triplets). Full details — TTS engine
+selection, WER QC, and voice control — are in
+[`Documentation/Progress_14_20260515.md`](Documentation/Progress_14_20260515.md).
 
 ---
 
@@ -400,153 +595,6 @@ Audio-native variant of Recipe 6. Same two-tower architecture; the modification 
 - **Why it matters**: closes the loop on the Motivation section's "speak as you browse" promise — the trained two-tower system serves both typed and spoken modification queries with zero architectural change.
 
 ---
-
-## Data generation
-
-The query-side **spoken modifications** are TTS-synthesized from the FACap
-dress-slice modification texts — there is no manually recorded speech in
-training. Audio enters the model natively through speechQwen2VL's Whisper
-encoder (no ASR step).
-
-Pipeline ([`src/data/build_tts_audio.py`](src/data/build_tts_audio.py)):
-
-1. **Source text** — FACap dress-train triplets (`reference image,
-   modification text, target image`); the modification string is the text to
-   voice.
-2. **Voice bank** — a VCTK reference bank of ~110 speakers (gender-balanced),
-   split into a ~100-speaker training pool + 10 held-out OOD speakers.
-   Chatterbox is a zero-shot voice clone, so each speaker's reference clip *is*
-   the voice.
-3. **Synthesis** — Chatterbox TTS renders every used triplet (train + dev +
-   headline) to a 16 kHz mono wav with a training-pool speaker; dev + headline
-   additionally get a held-out speaker for the separate OOD-voice eval
-   (~56,686 clips total).
-4. **Manifest** — `manifest.json` indexes every clip by FACap triplet index →
-   `{wav, speaker, split, gender, accent}`, under `in_dist` and `ood`
-   sub-dicts.
-
-Regenerate (needs VCTK extracted + a Chatterbox env):
-
-```bash
-python -m src.data.build_tts_audio bank                            # VCTK speaker bank + synthesis plan
-python -m src.data.build_tts_audio synth --shard 0 --num-shards 8  # one per GPU, resumable
-python -m src.data.build_tts_audio manifest                        # collate manifest.json
-```
-
-Inspect a sample of the synthesized audio in
-[`notebooks/audio_dataset_demo.ipynb`](notebooks/audio_dataset_demo.ipynb)
-(image + audio + Whisper transcript for 15 triplets). Full details — TTS engine
-selection, WER QC, and voice control — are in
-[`Documentation/Progress_14_20260515.md`](Documentation/Progress_14_20260515.md).
-
----
-
-## Setup (only when replicating on a fresh machine)
-
-The steps below rebuild the dataset and venv layout on a new machine — a GPU
-server, a fresh laptop, etc. **Skip this section on the dev machine that
-already has these things.** Re-running is safe: each step is idempotent.
-
-### 1. Clone third-party dataset repos
-
-```bash
-bash scripts/setup_datasets.sh
-```
-
-Clones four public repos into `data_exploration/datasets/`. Total ~240 MB of
-text annotations, **no images**.
-
-| Local path | Source | Purpose |
-|---|---|---|
-| `fashion-iq/` | github.com/XiaoxiaoGuo/fashion-iq | FashionIQ captions, splits, starter code |
-| `fashion-iq-metadata/` | github.com/hongwang600/fashion-iq-metadata | ASIN → Amazon image URL mapping |
-| `facap-repo/` | github.com/fgxaos/facap-sigir25-gennext | All FACap triplet + image-caption JSONs |
-| `fashion-200k/` | github.com/xthan/fashion-200k | README only; images on HuggingFace mirror |
-
-### 2. Python venv
-
-```bash
-python3 -m venv data_exploration/venv
-data_exploration/venv/bin/pip install requests pillow jupyter ipykernel \
-    tqdm matplotlib datasets
-```
-
-### 3. (Optional) Recreate the small image samples used by the notebook
-
-`setup_datasets.sh` pulls annotations only. To match the dev machine exactly,
-also run the two helpers described below — together they pull ~30 thumbnails
-(<1 MB total). Skip if you don't need to re-execute the notebook.
-
-## Data-fetching helpers
-
-Two thin helpers materialize the small image samples used during dataset
-exploration. They're designed to run on demand; nothing else in the repo
-fetches images automatically.
-
-### FashionIQ image fetcher (inside the notebook)
-
-`data_exploration/dataset_inspection.ipynb` defines `fetch_image(asin, url, cat)`,
-which downloads one Amazon-hosted image by ASIN and caches it under
-`data_exploration/datasets/fashion-iq-images/<cat>/<asin>.jpg`. The notebook's
-sampling cell calls this in a loop to pull ~14 triplets across dress, shirt,
-and toptee.
-
-- **Input:** ASIN strings parsed from `cap.<cat>.<split>.json` triplets, joined
-  to URLs from `fashion-iq-metadata/image_url/asin2url.<cat>.txt`.
-- **Output:** `.jpg` files cached locally; PIL.Image objects in memory for
-  rendering.
-- **When to run:** open the notebook and execute cells top to bottom — the
-  helper is invoked automatically. Images already on disk are reused.
-- **Failure modes:** Amazon may return 404/403 for individual ASINs; the
-  helper logs and skips them rather than failing the whole batch.
-
-### FACap dress sample fetcher (standalone script)
-
-```bash
-data_exploration/venv/bin/python data_exploration/fetch_facap_sample.py
-```
-
-Streams the `Marqo/fashion200k` HuggingFace mirror (~3.47 GB total, but only
-the first ~300 records are pulled — about 5 MB over the wire) and saves any
-images that match the first FACap dress triplets into
-`data_exploration/datasets/facap-images/`. It also writes a manifest JSON
-(`dress_sample_manifest.json`) listing the matched triplets for the
-notebook's FACap rendering cell to consume.
-
-- **Input:** `data_exploration/datasets/facap-repo/data/facap/cir_triplets/dress_train_triplets.json`
-  + the streaming HuggingFace dataset.
-- **Output:** ~5 `.jpeg` files (~70 KB total) and a manifest JSON.
-- **When to run:** once after `setup_datasets.sh`, if you want the notebook's
-  FACap section to render real images. The notebook's text cells work without
-  these.
-- **Knobs:** `STREAM_N` (how many HF records to scan) and `MAX_MATCHES`
-  (how many triplets to keep) at the top of the script.
-
-## Full image downloads (training-time)
-
-The setup script and helpers above cover **annotations + small samples**, not
-the full image data needed for training. When the implementation phase
-starts, the following downloads need to be added (no script exists yet —
-TODO: `scripts/download_full_datasets.py`):
-
-1. **FashionIQ images** — full splits across dress / shirt / toptee (~57k images).
-   - Source: Amazon CDN URLs in `fashion-iq-metadata/image_url/asin2url.*.txt`.
-   - Estimated 5–10 GB.
-   - Risk: Amazon URL rot. URLs were alive in 2026 but the dataset was released
-     at ICCV 2019, so long-term entries may drop.
-
-2. **Fashion200k images** — needed for FACap pretraining.
-   - HuggingFace mirror: `huggingface.co/datasets/Marqo/fashion200k`.
-   - ~3.47 GB, ~200k images.
-   - Stream by `item_ID` (e.g. `51727804_0`); FACap triplets reference these
-     by paths like `f200k_images/dresses/.../51727804_0.jpeg`.
-
-3. **DeepFashion-MultiModal images** — auxiliary FACap source.
-   - HuggingFace mirror: `huggingface.co/datasets/Marqo/deepfashion-multimodal`.
-
-Defer until the training plan specifies which splits and categories are
-actually needed — pretraining all six FACap categories vs. starting with just
-dress changes the disk and bandwidth footprint significantly.
 
 ## Baseline pipeline (`src/`)
 
