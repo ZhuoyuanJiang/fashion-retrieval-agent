@@ -16,7 +16,7 @@ sleeves"), retrieve the matching item from a fashion catalog. See
 - [Headline result](#headline-result)
 
 **🔧 Install & data**
-- [Setup](#setup) — fresh-machine install (env + dataset repos)
+- [Install & data](#install--data) — what to set up for any goal beyond the cached demo
 - [Data-fetching helpers](#data-fetching-helpers) — small sample images for the dataset notebook
 - [Full image downloads](#full-image-downloads-training-time) — FACap / FashionIQ / Fashion-200k catalogs
 - [Data generation](#data-generation) — FACap triplets → TTS spoken modifications
@@ -77,8 +77,9 @@ catalog (59K items). Source: [`src/demo/app.py`](src/demo/app.py).
 
 **Requirements:** Python 3.10+, conda, NVIDIA GPU with ≥16 GB VRAM (the demo loads a frozen 7B speech-VLM + the LoRA adapters on top).
 
-Get the demo running in 3 steps. (Full fresh-machine setup with dataset
-fetching is in [§Setup](#setup); training any pipeline from scratch is in
+Get the demo running in 3 steps. (For anything past the cached demo — your own
+queries, training, the exploration notebook — see [§Install &
+data](#install--data); training any pipeline from scratch is in
 [§Recipes](#recipes).)
 
 ### 1. Clone + create conda env
@@ -134,31 +135,48 @@ Open [http://localhost:7860](http://localhost:7860) and try it.
 
 ---
 
-## Setup
+## Install & data
 
-You'll need this section if you want to **train, run eval, or re-execute the
-exploration notebook** — anything beyond just running the demo. (The demo path
-is covered by [§Quick Start](#-quick-start) above.)
+[§Quick Start](#-quick-start) above runs the demo in **cached mode** — 8 preset
+queries with pre-computed results, no GPU, just click through. Anything past
+that needs more setup. **Pick by your goal:**
 
-The steps below set up dataset annotations + a small extra venv on a new
-machine. **3 steps:**
+- **Run the demo on your own image + query** (instead of the 8 presets) →
+  needs a GPU + the FACap image catalog
+  ([§Full image downloads](#full-image-downloads-training-time)) + a
+  HuggingFace login. Then re-run with `DEMO_STAGE=v0.2 bash scripts/run_demo.sh`.
 
-1. **Dataset annotations** — ~240 MB JSON from four public repos (no images).
-2. **Python venv** for the exploration notebook (a separate env from the main
-   `fashion_retrieval` one that Quick Start already set up).
-3. *(Optional)* ~30 sample images — only if you re-execute the notebook.
+- **Train any retrieval model yourself** (caption baselines or two-towers) →
+  needs the dataset annotations (§1 below) + the full image catalogs
+  ([§Full image downloads](#full-image-downloads-training-time)) + a multi-GPU
+  server ([§Phase B](#phase-b-contrastive-training-plans-510)).
 
-**Skip this section on the dev machine that already has these things.**
-Re-running is safe: each step is idempotent.
+- **Re-train the audio-native model from scratch** → same as training above,
+  plus the ~56K-clip synthetic spoken-modification audio dataset
+  ([§Data generation](#data-generation) regenerates it from the FACap
+  modification text via VCTK voices + Chatterbox TTS).
 
-### 1. Clone third-party dataset repos
+- **Explore the FACap / FashionIQ data in a Jupyter notebook** (just curious
+  what's in the data) → needs the annotations (§1) + the exploration-notebook
+  venv (§2) + a handful of sample images
+  ([§Data-fetching helpers](#data-fetching-helpers)).
+
+**Three steps below — §1 is needed by every goal above; §2 + §3 are only if
+you want to re-execute the dataset-exploration notebook.** All idempotent.
+
+### 1. Clone the data repos
+
+These are JSON files that **describe** the datasets — triplet IDs, captions,
+train/dev/test splits, image-filename ↔ URL mappings. They live separately
+from the actual image files (which you fetch via [§Full image
+downloads](#full-image-downloads-training-time)).
 
 ```bash
 bash scripts/setup_datasets.sh
 ```
 
-Clones four public repos into `data_exploration/datasets/`. Total ~240 MB of
-text annotations, **no images**.
+Clones four public repos into `data_exploration/datasets/` (~240 MB of JSON,
+no images):
 
 | Local path | Source | Purpose |
 |---|---|---|
@@ -167,7 +185,12 @@ text annotations, **no images**.
 | `facap-repo/` | github.com/fgxaos/facap-sigir25-gennext | All FACap triplet + image-caption JSONs |
 | `fashion-200k/` | github.com/xthan/fashion-200k | README only; images on HuggingFace mirror |
 
-### 2. Python venv
+### 2. Create the exploration-notebook venv (optional, notebook-only)
+
+A separate venv from the main `fashion_retrieval` conda env, because the
+[`dataset_inspection.ipynb`](data_exploration/dataset_inspection.ipynb)
+notebook only needs lightweight Python deps (jupyter + pillow + requests).
+Skip this unless you want to re-execute the notebook.
 
 ```bash
 python3 -m venv data_exploration/venv
@@ -175,7 +198,7 @@ data_exploration/venv/bin/pip install requests pillow jupyter ipykernel \
     tqdm matplotlib datasets
 ```
 
-### 3. (Optional) ~30 sample images for the exploration notebook
+### 3. Fetch about 30 sample images for the exploration notebook (optional)
 
 The [`data_exploration/dataset_inspection.ipynb`](data_exploration/dataset_inspection.ipynb)
 notebook — written **very early in the project, when we were first looking at
@@ -809,17 +832,17 @@ bash scripts/run_plan5.sh
 
 Defaults: 8 GPUs, batch 8/GPU, gather=ON, 18 epochs. Frozen FashionCLIP image encoder serves as the target; only the Qwen2VL query tower + projection head are trainable. Outputs land under `runs/plan5/<run_name>/`.
 
-### Plan-10: two-tower co-trained (current best)
+### Plan-10/13: two-tower co-trained (best text)
 
 ```bash
-# Option B — two separate Qwen2VL backbones (recommended; current best result)
-bash scripts/run_plan10.sh --arch separate
+# Shared backbone + 2 PEFT LoRA adapters (Plan-13, bs=24 → R@10 0.654 — best text)
+bash scripts/run_plan10.sh --arch shared --batch-size 24
 
-# Option A — shared backbone + two PEFT LoRA adapters (lower VRAM, in progress)
-bash scripts/run_plan10.sh --arch shared
+# Separate backbones (Plan-10 architecture comparison; dropped side branch)
+bash scripts/run_plan10.sh --arch separate
 ```
 
-Defaults: 8 GPUs, batch 8/GPU, gather=ON, 18 epochs, end-of-epoch gallery refresh. Both towers are trainable; the embedding space is co-constructed.
+Defaults: 8 GPUs, gather=ON, 18 epochs, end-of-epoch gallery refresh. Both towers are trainable; the embedding space is co-constructed. The audio-native variant (Plan-15, R@10 0.624) runs the same launcher with `--query-modality audio`. See [Recipe 6](#recipes) for the full story and the PEFT gradient-checkpointing fix that enabled bs=24.
 
 W&B run names auto-generate as `plan10/v1_<arch>_bs<N>_<G>x<gpu>_<date>` from `torch.cuda.get_device_name()`.
 
