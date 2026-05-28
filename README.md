@@ -23,11 +23,12 @@ sleeves"), retrieve the matching item from a fashion catalog. See
 
 **📐 Method, pipeline & architecture overviews**
 - [Pipeline comparison](#pipeline-comparison) — 7 retrieval pipelines across 3 architecture families
+- [Architecture families (deployment view)](#architecture-families-deployment-view) — components to provision for each family
 - [Model architecture (training view)](#model-architecture-training-view) — backbone, LoRA, pooling, projection, loss
 - [Results](#results) — headline table + encoder & caption ablations
-- [Recipes](#recipes) — exact commands to reproduce each pipeline
 
 **🛠 Running & training**
+- [Recipes](#recipes) — exact commands to reproduce each pipeline
 - [Baseline pipeline](#baseline-pipeline-src) — what each file in `src/` does
 - [Running the baseline](#running-the-baseline) — CPU smoke + unit tests
 - [Real VLM baseline on a server](#real-vlm-baseline-on-a-server) — single-GPU Qwen2VL caption baseline
@@ -505,7 +506,7 @@ representative recipes that anchored project decisions.
 
 **The audio extension (6 → 7):** since the backbone is speechQwen2VL — already natively audio-capable — swapping the text-mod input channel for a spoken-mod audio waveform requires **no architectural change**. Same two-tower system, same training loop, same eval; users can type *or* speak.
 
-### Architecture families (deployment view)
+## Architecture families (deployment view)
 
 If you wanted to **actually deploy** one of the 7 pipelines above in production, this section is the guide.
 
@@ -513,7 +514,7 @@ The 7 pipelines fall into **3 architecture families** — components within a fa
 
 *For the **training-side internals** of the winning family (C / two-tower) — backbone, LoRA, pooling, projection head, loss — see [§Model architecture (training view)](#model-architecture-training-view) below.*
 
-#### Family A — Caption-based retrieval (Pipelines 1, 2, 3)
+### Family A — Caption-based retrieval (Pipelines 1, 2, 3)
 
 ```
 OFFLINE INDEX  (built once per text encoder)
@@ -563,7 +564,7 @@ ONLINE QUERY
 
 **Deployment checklist:** ① a VLM captioner for the query side, ② a text encoder (your pick — swap to change which Pipeline 1/2/3 you're running) used **both** at indexing and querying, ③ a vector database holding `N × D` target embeddings. Index is static — build once, reuse forever.
 
-#### Family B — Query-tower contrastive (Pipeline 4 — Plan-6)
+### Family B — Query-tower contrastive (Pipeline 4 — Plan-6)
 
 ```
 OFFLINE INDEX  (built once)
@@ -602,7 +603,7 @@ ONLINE QUERY
 
 **Deployment checklist:** ① the frozen target image encoder (e.g. FashionCLIP — no training needed), ② a custom-trained query model (Qwen2VL + LoRA + projection), ③ a vector database. The query model is trained once and the target embeddings are fixed forever — index built only once.
 
-#### Family C — Two-tower joint embedding (Pipelines 5, 6, 7 — Plan-10)
+### Family C — Two-tower joint embedding (Pipelines 5, 6, 7 — Plan-10)
 
 ```
 OFFLINE INDEX  (rebuilt at end of every training epoch — target tower is trainable)
@@ -732,7 +733,15 @@ Same 11 encoders re-evaluated under a **detailed** VLM caption vs the original *
 
 ---
 
+# 🛠 Running & training
+
+*Source files, smoke tests, single-GPU baseline runs, and multi-GPU contrastive training.*
+
+---
+
 ## Recipes
+
+Each recipe below is a minimum reproduction guide for one of the 7 pipelines above — what to launch, what encoders/models you'll use, and the R@10 you should see.
 
 ### Recipe 1 — Caption + MiniLM-L6 (Plan-3 anchor)
 
@@ -741,6 +750,7 @@ The project's anchor baseline.
 - **Input**: reference image + modification text → VLM caption ("imagined target")
 - **Encoder**: `sentence-transformers/all-MiniLM-L6-v2`, frozen, 384-dim
 - **Code**: [`src/baseline/run_baseline.py`](src/baseline/run_baseline.py)
+- **Launch**: `bash scripts/run_baseline_v1.sh` (MiniLM is the default encoder)
 - **R@10**: 0.240
 - **Why it matters**: anchored the lower bound that every subsequent recipe is measured against.
 
@@ -749,7 +759,8 @@ The project's anchor baseline.
 After an 11-encoder ablation, Marqo-FashionCLIP was the strongest off-the-shelf encoder on the concise caption regime.
 
 - **Encoder**: `hf-hub:Marqo/marqo-fashionCLIP`, 512-dim
-- **Code**: [`scripts/run_encoder_swap.sh`](scripts/run_encoder_swap.sh) drives the 11-encoder sweep
+- **Code**: [`src/baseline/run_baseline.py`](src/baseline/run_baseline.py) (encoder swapped via the swap script)
+- **Launch**: `bash scripts/run_encoder_swap.sh` (sweeps all 11 encoders against the v1/concise baseline; FashionCLIP is the strongest row)
 - **R@10**: 0.533
 - **Why it matters**: locked the strongest fashion-specific frozen-encoder baseline; defines the gap the trained system must close.
 
@@ -758,6 +769,8 @@ After an 11-encoder ablation, Marqo-FashionCLIP was the strongest off-the-shelf 
 Same caption-retrieval shape as Recipe 2 but with a detailed VLM caption and the strongest general-purpose embedder.
 
 - **Encoder**: `Qwen/Qwen3-Embedding-8B`, 4096-dim
+- **Code**: [`src/baseline/run_baseline.py`](src/baseline/run_baseline.py) (encoder swapped via the swap script, against the v2 / detailed-caption baseline)
+- **Launch**: `SOURCE_RUN=runs/baseline_v2_speechqwen2vl_20260504 bash scripts/run_encoder_swap.sh`
 - **R@10**: 0.586
 - **Why it matters**: per-encoder × per-prompt interaction — detailed captions help Qwen3 but hurt FashionCLIP-family encoders.
 
@@ -769,12 +782,15 @@ First contrastive recipe. Query tower is a trainable Qwen2VL; target is the froz
 - **Target tower**: Marqo-FashionCLIP image encoder, frozen
 - **Loss**: symmetric multi-positive InfoNCE with cross-GPU `all_gather`
 - **Code**: [`src/training/train_plan5.py`](src/training/train_plan5.py)
+- **Launch**: `bash scripts/run_plan5.sh --multi-gpu --num-gpus 8 --batch-size 4 --gather` (single-GPU variant: `--batch-size 32` instead)
 - **R@10**: 0.402 — **regressed** from the 0.533 Phase-A baseline
 - **Why it matters**: the regression revealed the ceiling — the query tower was capped at FashionCLIP's discrimination. Motivated Recipe 5.
 
 ### Recipe 5 — Two-tower Qwen2VL, separate backbones (Plan-10 Option B) ✅ final
 
 Both query and target are trainable Qwen2VL towers. Embedding space co-constructed during training instead of inherited from a frozen teacher.
+
+**In plain terms:** "separate backbones" means **two full Qwen2VL instances live in GPU memory at the same time** — one driving the query tower, one driving the target tower — each with its own LoRA adapter on top. Memory cost: ~2× 7B base weights resident. The training objective (symmetric multi-positive InfoNCE) pulls matching `(query, target)` pairs together in the embedding space and pushes non-matching pairs apart.
 
 - **Both towers**: speechQwen2VL + LoRA + projection head → 512-dim
 - **Loss**: symmetric multi-positive InfoNCE with cross-GPU `all_gather`, dynamic database re-encoding at end of every epoch
@@ -787,6 +803,8 @@ Both query and target are trainable Qwen2VL towers. Embedding space co-construct
 
 Same loss / data / eval as Recipe 5, but with **one shared Qwen2VL backbone** plus two PEFT LoRA adapters toggled via `set_adapter`. Trades adapter cross-talk risk for half the VRAM — which is what later lets the batch (and the score) grow.
 
+**In plain terms (vs Recipe 5):** only **one Qwen2VL base lives in GPU memory** — both towers share it. Each tower still has its own small LoRA adapter attached to that shared base; at forward time we call `set_adapter('query')` or `set_adapter('target')` to enable the right one. Memory: ~1× 7B base (about half of Recipe 5), which is what frees the VRAM to push the batch (and the score) up.
+
 - **The PEFT gradient-checkpointing fix**: the first shared run (Plan-10 Option A) had to *disable* gradient checkpointing (PEFT footgun — checkpoint recompute reads the *current* `active_adapter` rather than the one active during forward; [`Progress_11`](Documentation/Progress_11_20260512.md)), forcing bs=4 → R@10 0.587. Plan-12 replaced it with a **PEFT-aware `context_fn`** that re-enables checkpointing safely → bs=8 (0.623), then bs=24 (Plan-13) → **R@10 0.654**, the project's best text result. Batch size, not architecture, drove ~74% of the earlier shared-vs-separate gap ([`Progress_12`](Documentation/Progress_12_20260513.md)).
 - **Code**: [`src/training/two_tower_model.py`](src/training/two_tower_model.py) (`TwoTowerSharedBackbone`)
 - **Launch**: `bash scripts/run_plan10.sh --arch shared --batch-size 24`
@@ -794,21 +812,16 @@ Same loss / data / eval as Recipe 5, but with **one shared Qwen2VL backbone** pl
 
 ### Recipe 7 — Two-tower Qwen2VL with native audio query (Plan-15) 🎙️ ✅ flagship
 
-Audio-native variant of Recipe 6. Same two-tower architecture; the modification channel on the query side is replaced by a spoken-modification audio waveform consumed directly by speechQwen2VL's audio encoder — no separate ASR step.
+Once Recipe 6 (shared-backbone two-tower) emerged as the best text-side architecture, we added the audio modality **on top of that exact same model**. Recipe 7 is the audio-native variant: identical two-tower architecture, identical training loop, identical shared-backbone + 2 LoRA setup — **the only thing that changes is the query-side modification channel**, which is now a spoken-modification audio waveform consumed directly by speechQwen2VL's audio encoder (no separate ASR step).
 
 - **Both towers**: speechQwen2VL + LoRA + projection head → 512-dim (identical to Recipe 6)
 - **Query input**: `(reference image, spoken modification)` — audio tokens fed natively into the backbone
 - **Target tower**: identical to Recipe 6 — `(target image, "Describe this image in detail.")`
 - **Loss / training**: same symmetric multi-positive InfoNCE with cross-GPU `all_gather`, dynamic end-of-epoch gallery refresh
 - **Code**: extension of [`src/training/train_plan10.py`](src/training/train_plan10.py) with an audio collator
+- **Launch**: `bash scripts/run_plan10.sh --arch shared --batch-size 32 --query-modality audio`
 - **R@10**: **0.624** (Plan-15, dev-selected checkpoint; 0.643 best-checkpoint) — only ~0.03 below the typed-modification Recipe 6, confirming the audio-native query is competitive with text. A 3-way sensitivity probe (real / no-audio / shuffled-audio) confirms the result is genuinely audio-driven. See [`Progress_15`](Documentation/Progress_15_20260518.md).
 - **Why it matters**: closes the loop on the Motivation section's "speak as you browse" promise — the trained two-tower system serves both typed and spoken modification queries with zero architectural change.
-
----
-
-# 🛠 Running & training
-
-*Source files, smoke tests, single-GPU baseline runs, and multi-GPU contrastive training.*
 
 ---
 
@@ -991,7 +1004,7 @@ The training pipeline for Phase B contrastive recipes (Recipes 4, 5, 6).
 
 - **Hardware**: ≥ 7× A6000-class GPU (≈ 49 GB VRAM each) for the default Plan-10 config (`--arch separate`, batch 8, 8 GPUs, gather=ON). Option A (shared backbone, `--arch shared`) can run on fewer GPUs at smaller batch sizes — see `scripts/run_plan10.sh` flag overrides.
 - **Disk**: ≥ 30 GB free on a fast local SSD for `HF_HOME` — Qwen2-VL-7B-Speech ≈ 17 GB + Stage-2 LoRA ≈ 650 MB + gallery embeddings ≈ 120 MB × 18 epochs.
-- **FACap images**: the full ~60 K FACap dress image set must be available at `$FACAP_IMAGES_DIR`. The existing helper (`data_exploration/fetch_facap_sample.py`) pulls 5 samples only — for the full set, stream `huggingface.co/datasets/Marqo/fashion200k` and save items matching the IDs in `data_exploration/datasets/facap-repo/data/facap/cir_triplets/dress_*.json`. (A reusable script is on the project TODO list; pull requests welcome.)
+- **FACap images**: the full ~60 K FACap dress image set must be available at `$FACAP_IMAGES_DIR`. Fetch it via `bash scripts/fetch_artifacts.sh --with-images` (see [§Download original data → Full image downloads](#full-image-downloads-training-time) above).
 - **Required env vars** (export before invoking any `run_plan*.sh`):
   ```bash
   export HF_HOME=/path/to/local/ssd/hf_cache
