@@ -12,7 +12,8 @@ sleeves"), retrieve the matching item from a fashion catalog. See
 **🪧 Intro**
 - [Project motivation](#project-motivation) — what the system does and why
 - [Demo](#demo) — what the running app looks like
-- [Quick Start](#-quick-start) — 3-step path to the running demo
+- [Quick Start](#-quick-start) — 4-step path to the running demo
+- [Demo: beyond cached mode](#demo-beyond-cached-mode) — env vars to enable live retrieval, live audio recording, custom paths
 - [Headline result](#headline-result)
 
 **🔧 Install & data**
@@ -76,8 +77,9 @@ catalog (59K items). Source: [`src/demo/app.py`](src/demo/app.py).
 
 **Requirements:** Python 3.10+, conda, NVIDIA GPU with ≥16 GB VRAM (the demo loads a frozen 7B speech-VLM + the LoRA adapters on top).
 
-Get the demo running in 3 steps. (For anything past the cached demo — your own
-queries, training, the exploration notebook — see [§Download original
+Get the demo running in 4 steps. (For anything past the cached demo — your own
+queries, training, the exploration notebook — see [§Demo: beyond cached
+mode](#demo-beyond-cached-mode) and [§Download original
 data](#download-original-data); training any pipeline from scratch is in
 [§Recipes](#recipes).)
 
@@ -100,7 +102,14 @@ download from HF on first use.
 huggingface-cli login
 ```
 
-### 3. Run the demo
+### 3. (One-time) Fetch product images needed by demo
+
+```bash
+bash scripts/fetch_artifacts.sh --with-images   # download all ~59K FACap images (upstream mirror has no "subset" option)
+python scripts/make_demo_thumbs.py              # extract the ~1085 images the demo actually uses
+```
+
+### 4. Run the demo (cached version)
 
 ```bash
 conda activate fashion_retrieval
@@ -108,6 +117,65 @@ bash scripts/run_demo.sh        # opens http://localhost:7860
 ```
 
 Open [http://localhost:7860](http://localhost:7860) and try it.
+
+For non-default modes (live audio recording, live retrieval, custom port,
+non-default paths), see [§Demo: beyond cached
+mode](#demo-beyond-cached-mode) below.
+
+---
+
+## Demo: beyond cached mode
+
+<details>
+<summary><b>Click to expand</b> — env-var recipes for live audio recording, live retrieval, custom paths, custom port</summary>
+
+<br>
+
+The [Quick Start](#-quick-start) above runs the demo in **cached mode** — 8
+preset queries with pre-computed top-K results, no GPU at request time. You
+can also run the demo with your own image + spoken query (instead of the 8
+presets), enable live audio recording, override default paths on a fresh
+machine, or change the Gradio port/sharing. Set env vars before launching
+`bash scripts/run_demo.sh`:
+
+**Try your own image + spoken query** (live retrieval over the full catalog;
+needs a GPU + the FACap images you fetched in Quick Start step 3):
+
+```bash
+export DEMO_STAGE=v0.2
+bash scripts/run_demo.sh
+```
+
+**Live audio recording** (records your own speech, runs the Plan-15 audio
+two-tower on it):
+
+```bash
+export LIVE_AUDIO=1
+bash scripts/run_demo.sh
+```
+
+**Override paths on a non-default machine** (e.g., if you put the model or
+the FACap images somewhere other than the dev-server defaults):
+
+```bash
+export AUDIO_2T_CKPT=/your/path/to/audio/checkpoint
+export AUDIO_2T_GALLERY=/your/path/to/gallery_emb.npy
+export GALLERY_DIR=/your/path/to/facap-images
+bash scripts/run_demo.sh
+```
+
+**Run on a different port or share publicly** (Gradio settings):
+
+```bash
+export GRADIO_SERVER_PORT=8080         # default 7860
+export GRADIO_SHARE=1                  # gets a *.gradio.live public tunnel URL
+bash scripts/run_demo.sh
+```
+
+Full env-var list with defaults at the top of
+[`src/demo/config.py`](src/demo/config.py).
+
+</details>
 
 ---
 
@@ -889,6 +957,17 @@ The full design and execution history lives in [`Documentation/`](Documentation/
 
 - `Documentation/` — proposals, plans, progress reports, meeting memos.
 - `data_exploration/` — inspection notebook, sample fetchers, scratch space.
+- `demo_assets/` — cached data the demo loads at startup:
+  ```
+  demo_assets/
+  ├── preset_cache.json    8 preset queries + cached top-K results per pipeline
+  ├── preset_audio/        TTS audio for each preset's spoken modification (~2.4 MB)
+  ├── survey.jsonl         past-user feedback notes
+  └── preset_thumbs/       gitignored — product image thumbnails the demo gallery
+                           shows. Generate locally with
+                           `python scripts/make_demo_thumbs.py` (needs FACap images
+                           first; run `bash scripts/fetch_artifacts.sh --with-images`).
+  ```
 - `scripts/` — reproducibility helpers.
 - `src/` — baseline implementation (Plan_2 M1–M3); entry point is `src/baseline/run_baseline.py`.
 - `tests/` — runnable test suite for M1–M3 (13 cases).
