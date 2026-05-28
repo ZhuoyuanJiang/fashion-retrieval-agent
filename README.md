@@ -16,10 +16,9 @@ sleeves"), retrieve the matching item from a fashion catalog. See
 - [Headline result](#headline-result)
 
 **🔧 Install & data**
-- [Install & data](#install--data) — what to set up for any goal beyond the cached demo
-- [Data-fetching helpers](#data-fetching-helpers) — small sample images for the dataset notebook
-- [Full image downloads](#full-image-downloads-training-time) — FACap / FashionIQ / Fashion-200k catalogs
-- [Data generation](#data-generation) — FACap triplets → TTS spoken modifications
+- [Download original data](#download-original-data) — dataset annotations + full image catalogs (when you want more than the cached demo)
+- [Data exploration](#data-exploration) — venv + sample images for the dataset-exploration notebook
+- [Synthetic training data generation](#synthetic-training-data-generation) — TTS spoken modifications for training the audio-native model
 
 **📐 Method, pipeline & architecture overviews**
 - [Pipeline comparison](#pipeline-comparison) — 7 retrieval pipelines across 3 architecture families
@@ -78,8 +77,8 @@ catalog (59K items). Source: [`src/demo/app.py`](src/demo/app.py).
 **Requirements:** Python 3.10+, conda, NVIDIA GPU with ≥16 GB VRAM (the demo loads a frozen 7B speech-VLM + the LoRA adapters on top).
 
 Get the demo running in 3 steps. (For anything past the cached demo — your own
-queries, training, the exploration notebook — see [§Install &
-data](#install--data); training any pipeline from scratch is in
+queries, training, the exploration notebook — see [§Download original
+data](#download-original-data); training any pipeline from scratch is in
 [§Recipes](#recipes).)
 
 ### 1. Clone + create conda env
@@ -135,7 +134,7 @@ Open [http://localhost:7860](http://localhost:7860) and try it.
 
 ---
 
-## Install & data
+## Download original data
 
 [§Quick Start](#-quick-start) above runs the demo in **cached mode** — 8 preset
 queries with pre-computed results, no GPU, just click through. Anything past
@@ -144,39 +143,51 @@ that needs more setup. **Pick by your goal:**
 - **Run the demo on your own image + query** (instead of the 8 presets) →
   needs a GPU + the FACap image catalog
   ([§Full image downloads](#full-image-downloads-training-time)) + a
-  HuggingFace login. Then re-run with `DEMO_STAGE=v0.2 bash scripts/run_demo.sh`.
+  HuggingFace login. Then re-run with
+  `DEMO_STAGE=v0.2 bash scripts/run_demo.sh`.
 
 - **Train any retrieval model yourself** (caption baselines or two-towers) →
-  needs the dataset annotations (§1 below) + the full image catalogs
+  needs the [dataset annotations](#annotations--240-mb-json-no-images) +
+  the full image catalogs
   ([§Full image downloads](#full-image-downloads-training-time)) + a multi-GPU
   server ([§Phase B](#phase-b-contrastive-training-plans-510)).
 
 - **Re-train the audio-native model from scratch** → same as training above,
   plus the ~56K-clip synthetic spoken-modification audio dataset
-  ([§Data generation](#data-generation) regenerates it from the FACap
-  modification text via VCTK voices + Chatterbox TTS).
+  ([§Synthetic training data generation](#synthetic-training-data-generation)
+  regenerates it from the FACap modification text via VCTK voices + Chatterbox
+  TTS).
 
 - **Explore the FACap / FashionIQ data in a Jupyter notebook** (just curious
-  what's in the data) → needs the annotations (§1) + the exploration-notebook
-  venv (§2) + a handful of sample images
-  ([§Data-fetching helpers](#data-fetching-helpers)).
+  what's in the data) → needs the
+  [dataset annotations](#annotations--240-mb-json-no-images) +
+  the [exploration-notebook venv](#create-the-notebook-venv-optional) +
+  [~30 sample images](#fetch-about-30-sample-images-for-the-notebook-optional)
+  (the latter two in [§Data exploration](#data-exploration)).
 
-**Three steps below — §1 is needed by every goal above; §2 + §3 are only if
-you want to re-execute the dataset-exploration notebook.** All idempotent.
+Two kinds of original data to pull from upstream: **annotations** (the JSON
+files that describe the datasets) and the **image catalogs themselves**.
 
-### 1. Clone the data repos
+### Annotations (~240 MB JSON, no images)
 
 These are JSON files that **describe** the datasets — triplet IDs, captions,
-train/dev/test splits, image-filename ↔ URL mappings. They live separately
-from the actual image files (which you fetch via [§Full image
-downloads](#full-image-downloads-training-time)).
+train/dev/test splits, image-filename ↔ URL mappings. A FACap dress-train
+annotation row looks like:
+
+```json
+{"reference": "51727804_0", "modification": "is more fitted and shorter, with vibrant red", "target": "89255983_0"}
+```
+
+— it tells you which image IDs form the triplet and what the modification
+text is. The JSONs **include the URLs** where each image lives upstream, but
+**not the image bytes themselves**. The actual JPEG/PNG image files live
+separately and are downloaded by the next subsection.
 
 ```bash
 bash scripts/setup_datasets.sh
 ```
 
-Clones four public repos into `data_exploration/datasets/` (~240 MB of JSON,
-no images):
+Clones four public repos into `data_exploration/datasets/`:
 
 | Local path | Source | Purpose |
 |---|---|---|
@@ -185,12 +196,59 @@ no images):
 | `facap-repo/` | github.com/fgxaos/facap-sigir25-gennext | All FACap triplet + image-caption JSONs |
 | `fashion-200k/` | github.com/xthan/fashion-200k | README only; images on HuggingFace mirror |
 
-### 2. Create the exploration-notebook venv (optional, notebook-only)
+### Full image downloads (training-time)
+
+The annotations above only contain image-filename ↔ URL mappings, not the
+actual image bytes. The full image data needed for training (and for live
+demo retrieval — `DEMO_STAGE=v0.2`) lives on upstream mirrors and is fetched
+separately.
+
+**FACap dress images (~3.5 GB, ~59K JPEGs).** Sourced from the
+`Marqo/fashion200k` HuggingFace mirror. The reproducibility script handles
+this:
+
+```bash
+bash scripts/fetch_artifacts.sh --with-images
+```
+
+Populates `facap-images/` so the demo can display product thumbnails (combined
+with `scripts/make_demo_thumbs.py`) and so training runs have something to
+retrieve against.
+
+**Other catalogs (FashionIQ + DeepFashion-MultiModal).** Needed only if you
+want to pretrain or evaluate across the broader CIR datasets. No bundled
+script yet; pull manually:
+
+1. **FashionIQ images** — full splits across dress / shirt / toptee (~57k images).
+   - Source: Amazon CDN URLs in `fashion-iq-metadata/image_url/asin2url.*.txt`.
+   - Estimated 5–10 GB.
+   - Risk: Amazon URL rot. URLs were alive in 2026 but the dataset was released
+     at ICCV 2019, so long-term entries may drop.
+
+2. **DeepFashion-MultiModal images** — auxiliary FACap source.
+   - HuggingFace mirror: `huggingface.co/datasets/Marqo/deepfashion-multimodal`.
+
+Defer these until your training plan specifies which splits and categories
+are actually needed — pretraining all six FACap categories vs. starting with
+just dress changes the disk and bandwidth footprint significantly.
+
+## Data exploration
+
+The [`data_exploration/dataset_inspection.ipynb`](data_exploration/dataset_inspection.ipynb)
+notebook renders a few example FACap / FashionIQ triplets inline — reference
+image + modification text + target image, side by side — so you can **see
+what the data actually looks like**. The notebook has saved outputs, so you
+can **browse it directly on GitHub** without setting anything up.
+
+This section is only needed if you want to **re-execute or extend** the
+notebook locally on a fresh machine — e.g., to verify the saved outputs
+reproduce, or to add your own cells on top of the existing exploration.
+Two steps, both optional.
+
+### Create the notebook venv (optional)
 
 A separate venv from the main `fashion_retrieval` conda env, because the
-[`dataset_inspection.ipynb`](data_exploration/dataset_inspection.ipynb)
 notebook only needs lightweight Python deps (jupyter + pillow + requests).
-Skip this unless you want to re-execute the notebook.
 
 ```bash
 python3 -m venv data_exploration/venv
@@ -198,25 +256,13 @@ data_exploration/venv/bin/pip install requests pillow jupyter ipykernel \
     tqdm matplotlib datasets
 ```
 
-### 3. Fetch about 30 sample images for the exploration notebook (optional)
+### Fetch about 30 sample images for the notebook (optional)
 
-The [`data_exploration/dataset_inspection.ipynb`](data_exploration/dataset_inspection.ipynb)
-notebook — written **very early in the project, when we were first looking at
-what FACap/FashionIQ data actually contains** — renders a few example triplets
-inline. To re-execute it, you need ~30 thumbnails (<1 MB total), pulled by the
-two helpers in [§Data-fetching helpers](#data-fetching-helpers) below.
+The notebook needs ~30 thumbnails (<1 MB total) to render its example triplets.
+Two thin fetchers handle this, each serving one of the two datasets the
+notebook renders:
 
-**Skip this step if** you don't plan to re-run that exploration notebook (most
-readers won't). **The demo itself does not depend on these sample images.**
-
-## Data-fetching helpers
-
-Two thin helpers materialize the small image samples used during dataset
-exploration. They're designed to run on demand; nothing else in the repo
-fetches images automatically.
-
-### FashionIQ image fetcher (inside the notebook)
-
+**FashionIQ image fetcher (inside the notebook).**
 `data_exploration/dataset_inspection.ipynb` defines `fetch_image(asin, url, cat)`,
 which downloads one Amazon-hosted image by ASIN and caches it under
 `data_exploration/datasets/fashion-iq-images/<cat>/<asin>.jpg`. The notebook's
@@ -232,7 +278,7 @@ and toptee.
 - **Failure modes:** Amazon may return 404/403 for individual ASINs; the
   helper logs and skips them rather than failing the whole batch.
 
-### FACap dress sample fetcher (standalone script)
+**FACap dress sample fetcher (standalone script).**
 
 ```bash
 data_exploration/venv/bin/python data_exploration/fetch_facap_sample.py
@@ -254,33 +300,7 @@ notebook's FACap rendering cell to consume.
 - **Knobs:** `STREAM_N` (how many HF records to scan) and `MAX_MATCHES`
   (how many triplets to keep) at the top of the script.
 
-## Full image downloads (training-time)
-
-The setup script and helpers above cover **annotations + small samples**, not
-the full image data needed for training. When the implementation phase
-starts, the following downloads need to be added (no script exists yet —
-TODO: `scripts/download_full_datasets.py`):
-
-1. **FashionIQ images** — full splits across dress / shirt / toptee (~57k images).
-   - Source: Amazon CDN URLs in `fashion-iq-metadata/image_url/asin2url.*.txt`.
-   - Estimated 5–10 GB.
-   - Risk: Amazon URL rot. URLs were alive in 2026 but the dataset was released
-     at ICCV 2019, so long-term entries may drop.
-
-2. **Fashion200k images** — needed for FACap pretraining.
-   - HuggingFace mirror: `huggingface.co/datasets/Marqo/fashion200k`.
-   - ~3.47 GB, ~200k images.
-   - Stream by `item_ID` (e.g. `51727804_0`); FACap triplets reference these
-     by paths like `f200k_images/dresses/.../51727804_0.jpeg`.
-
-3. **DeepFashion-MultiModal images** — auxiliary FACap source.
-   - HuggingFace mirror: `huggingface.co/datasets/Marqo/deepfashion-multimodal`.
-
-Defer until the training plan specifies which splits and categories are
-actually needed — pretraining all six FACap categories vs. starting with just
-dress changes the disk and bandwidth footprint significantly.
-
-## Data generation
+## Synthetic training data generation
 
 The query-side **spoken modifications** are TTS-synthesized from the FACap
 dress-slice modification texts — there is no manually recorded speech in
