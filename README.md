@@ -23,7 +23,7 @@ sleeves"), retrieve the matching item from a fashion catalog. See
 
 **📐 Method, pipeline & architecture overviews**
 - [Pipeline comparison](#pipeline-comparison) — 7 retrieval pipelines across 3 architecture families
-- [Architecture](#architecture) — two-tower joint embedding
+- [Model architecture (training view)](#model-architecture-training-view) — backbone, LoRA, pooling, projection, loss
 - [Results](#results) — headline table + encoder & caption ablations
 - [Recipes](#recipes) — exact commands to reproduce each pipeline
 
@@ -43,7 +43,7 @@ sleeves"), retrieve the matching item from a fashion catalog. See
 
 ## Project motivation
 
-When I'm shopping in a store and see a piece of clothing I like, if I want to find a similar version, I might first take a photo of it, then later type to ask the model whether there's a similar version, or whether it comes in another color.
+When I'm shopping in a store and see a piece of clothing I like, if I want to find a similar version, I might first take a photo of it, then later type to ask in a search engine (or nowadays probably an LLM, e.g. ChatGPT) whether there's a similar version, or whether it comes in another color.
 
 But this kind of interaction is actually quite slow, because I need to keep stopping to type.
 
@@ -54,7 +54,7 @@ If I could just keep looking at the clothes and at the same time directly speak:
 
 Then the whole flow would be much more natural — and better suited to real-time shopping exploration.
 
-**This project** lets a user **point a camera at a garment** and **speak (or type) a modification** ("make it black", "shorter sleeves", "something similar but more formal"). The system jointly interprets the visual scene + spoken request and returns the matching item from a 59K-product catalog in **one shot** — so people can reduce shopping friction and refine their search in the moment, without ever stopping to type.
+**This project aims to develop a model** that lets a user **point a camera at a garment** and **speak (or type) a modification** ("make it black", "shorter sleeves", "something similar but more formal"). The system then jointly interprets the visual scene + spoken request and returns the matching item from a clothing database (e.g., a 59K-product catalog) in **one shot** — so people can reduce shopping friction and refine their search in the moment, without ever stopping to type.
 
 ---
 
@@ -193,12 +193,18 @@ Full env-var list with defaults at the top of
 
 **Jump to:**
 [Pipelines](#pipeline-comparison) ·
-[Architecture](#architecture) ·
+[Model architecture](#model-architecture-training-view) ·
 [Results](#results) ·
 [Recipes](#recipes) ·
 [Phase B training](#phase-b-contrastive-training-plans-510) ·
 [Demo](#demo) ·
 [Docs](#documentation-index)
+
+---
+
+# 🔧 Install & data
+
+*How to fetch data and set up dependencies for any goal past Quick Start.*
 
 ---
 
@@ -408,11 +414,75 @@ selection, WER QC, and voice control — are in
 
 ---
 
+# 📐 Method, pipeline & architecture overviews
+
+*The retrieval architectures we tried and the pipelines they produced — from caption baselines to the audio-native flagship.*
+
+---
+
 ## Pipeline comparison
 
-Seven retrieval pipelines were designed, trained, and benchmarked across the project's lifecycle. The system progressed from **text-only caption retrieval** (Phase A) to **co-trained two-tower multi-modal retrieval** (Phase B), and finally to **native audio query** (Plan-10 V4) — built on a speech-extended VLM backbone that consumes audio tokens directly, no ASR step.
+Throughout the project, we tried **three different retrieval architectures**
+before adding the audio modality:
 
-> The 6 pipelines below are the **representative recipes** that anchored project decisions. Inside Family A specifically, we benchmarked **11 retrieval encoders × 2 caption regimes** (concise vs detailed VLM caption); see the [Encoder ablation](#encoder-ablation-phase-a-11-retrieval-encoders) and [Caption-prompt ablation](#caption-prompt-ablation-plan-9) tables under *Results* for the full sweep.
+1. **Caption-based retrieval** (Phase A, no model training) — three steps:
+   (a) an off-the-shelf VLM (e.g., Qwen2-VL) generates a *target* caption
+   from the `(reference image, text-modification)` input — i.e., a textual
+   description of what the modified garment should look like;
+   (b) a frozen text encoder (MiniLM / Marqo-FashionCLIP / Qwen3-Emb / ...)
+   turns that caption into a vector;
+   (c) cosine-similarity nearest-neighbor over the **catalog** — a
+   precomputed index of caption embeddings, one caption per item, all 59K
+   items in the FACap dress slice, encoded by the same text encoder.
+   → Pipelines 1, 2, 3.
+
+2. **Two-tower with separate Qwen backbones** (Phase B, Plan-10 Option B) —
+   the **query tower** takes `(reference image, text-modification)` and
+   produces a 512-d query embedding; the **target tower** takes a target
+   image and produces a 512-d target embedding; both are trained end-to-end
+   with contrastive (InfoNCE) loss so matching pairs land close in a shared
+   embedding space. Each tower has its own independent Qwen2-VL backbone +
+   LoRA. At retrieval time, the **catalog** is the target-tower embeddings
+   of all 59K target images, precomputed once.
+   → Pipeline 5.
+
+3. **Two-tower with shared backbone + 2 LoRA adapters** (Phase B, Plan-10
+   Option A → Plan-12/13) — same query/target setup as stage 2, but instead
+   of two independent Qwen backbones, **one frozen Qwen2-VL backbone serves
+   both towers** via PEFT LoRA adapters (one per tower, swapped at forward
+   time). Saves roughly half the GPU memory, which is what lets the batch
+   grow to 24 (more in-batch negatives → better contrastive learning).
+   **This became the main line and produced the best text result
+   (R@10 0.654).**
+   → Pipeline 6.
+
+Plus one intermediate experiment (Pipeline 4 — Plan-6) sits between stages
+1 and 2: a **query-tower-only contrastive setup** — only the query side is
+trained (Qwen2-VL + projection head), with a frozen off-the-shelf
+FashionCLIP image encoder as the target. Proved the contrastive paradigm
+worked but capped at FashionCLIP's discrimination — which motivated
+stage 2's full co-trained two-tower.
+
+**Then the audio modality was added on top of stage 3** — same query/target
+setup as stage 3, but the query input is now `(reference image,
+spoken-modification waveform)` instead of `(reference image, typed-text
+modification)`. The waveform goes through speechQwen2VL's Whisper audio
+encoder directly, with no ASR conversion to text in between. Audio-native
+flagship: **R@10 0.624**.
+→ Pipeline 7 (Plan-15).
+
+*(Engineer view: each of these 3 stages maps to a deployment Family — see
+[§Architecture families](#architecture-families-deployment-view) below for
+the component-level diagrams.)*
+
+The table below lists all **7 pipelines** with their headline R@10 — the
+representative recipes that anchored project decisions.
+
+> Inside Family A specifically, we also benchmarked **11 retrieval encoders ×
+> 2 caption regimes** (concise vs detailed VLM caption); see the
+> [Encoder ablation](#encoder-ablation-phase-a-11-retrieval-encoders) and
+> [Caption-prompt ablation](#caption-prompt-ablation-plan-9) tables under
+> *Results* for the full sweep.
 
 | # | Pipeline | Query input | Target encoder | Trainable | R@10 | Status |
 |---|---|---|---|---|---|---|
@@ -424,13 +494,24 @@ Seven retrieval pipelines were designed, trained, and benchmarked across the pro
 | 6 | **Two-tower Qwen2VL — shared backbone + 2 LoRA adapters (Plan-10 → 13)** | (image, text) | Qwen2VL (trainable) | **both** | **0.654** | **best (text)** |
 | 7 | **Two-tower Qwen2VL + native audio query (Plan-15)** | **(image, audio)** | Qwen2VL (trainable) | **both** | **0.624** | **flagship — audio-native, competitive with text** 🎙️ |
 
+> *Note on the* Query input *column*: Pipelines 1–3 (caption-based) show
+> the VLM-generated caption that the frozen text encoder actually sees —
+> the user originally provides `(reference image, text-modification)`, and
+> the VLM converts it to a caption upstream. Pipelines 4–7 (contrastive)
+> show what the trained query tower receives directly, without that
+> intermediate caption step.
+
 **The key insight (4 → 5):** replacing a frozen target encoder with a **co-trained** target tower lets the embedding space be **constructed end-to-end** by both towers rather than inherited from a frozen teacher — improving R@10 from 0.402 to 0.637 (+58.5 % relative) on the same data.
 
 **The audio extension (6 → 7):** since the backbone is speechQwen2VL — already natively audio-capable — swapping the text-mod input channel for a spoken-mod audio waveform requires **no architectural change**. Same two-tower system, same training loop, same eval; users can type *or* speak.
 
 ### Architecture families (deployment view)
 
-The 6 pipelines fall into **3 architecture families** — components within a family are identical, only the specific models swap. The diagrams below show **what to deploy** for each family: every model called out is a real component you need to provision (a captioner, an encoder, a database, …). Each diagram is split into **OFFLINE INDEX** (how the 59K target embeddings get into the database) and **ONLINE QUERY** (what happens at search time).
+If you wanted to **actually deploy** one of the 7 pipelines above in production, this section is the guide.
+
+The 7 pipelines fall into **3 architecture families** — components within a family are identical, only the specific models swap. The diagrams below show **what to deploy** for each family: every model called out is a real component you need to provision (a captioner, an encoder, a database, …). Each diagram is split into **OFFLINE INDEX** (how the 59K target embeddings get into the database) and **ONLINE QUERY** (what happens at search time).
+
+*For the **training-side internals** of the winning family (C / two-tower) — backbone, LoRA, pooling, projection head, loss — see [§Model architecture (training view)](#model-architecture-training-view) below.*
 
 #### Family A — Caption-based retrieval (Pipelines 1, 2, 3)
 
@@ -569,7 +650,9 @@ ONLINE QUERY
 
 ---
 
-## Architecture
+## Model architecture (training view)
+
+*If you wanted to **actually build and train** the winning two-tower yourself, the diagram below walks through how it's wired up internally — backbone, adapters, pooling, projection head, loss. For **what components you'd need to deploy** this in production, see [§Architecture families (deployment view)](#architecture-families-deployment-view) above.*
 
 Plan-10 V1 (Pipelines 5 & 6) — **two-tower joint embedding** trained with symmetric multi-positive InfoNCE:
 
@@ -720,6 +803,12 @@ Audio-native variant of Recipe 6. Same two-tower architecture; the modification 
 - **Code**: extension of [`src/training/train_plan10.py`](src/training/train_plan10.py) with an audio collator
 - **R@10**: **0.624** (Plan-15, dev-selected checkpoint; 0.643 best-checkpoint) — only ~0.03 below the typed-modification Recipe 6, confirming the audio-native query is competitive with text. A 3-way sensitivity probe (real / no-audio / shuffled-audio) confirms the result is genuinely audio-driven. See [`Progress_15`](Documentation/Progress_15_20260518.md).
 - **Why it matters**: closes the loop on the Motivation section's "speak as you browse" promise — the trained two-tower system serves both typed and spoken modification queries with zero architectural change.
+
+---
+
+# 🛠 Running & training
+
+*Source files, smoke tests, single-GPU baseline runs, and multi-GPU contrastive training.*
 
 ---
 
@@ -937,6 +1026,10 @@ W&B run names auto-generate as `plan10/v1_<arch>_bs<N>_<G>x<gpu>_<date>` from `t
 ### Eval
 
 Both training scripts run dev + headline retrieval evaluation at every 0.5 epoch automatically. Numbers logged to W&B (`fashion-retrieval-agent` project) and persisted to `runs/<run_name>/metrics.json`.
+
+---
+
+# 📚 Meta
 
 ---
 
