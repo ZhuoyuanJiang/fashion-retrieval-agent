@@ -859,7 +859,7 @@ Local 8 GB-VRAM laptops can run the mock and oracle backends; the real VLM backe
 
 #### Whole Pipeline Check / Smoke runs
 
-This section is the lightest sanity check — running the whole pipeline end-to-end with fake (mock/oracle) captioners just to see if anything crashes. It doesn't tell you whether the numbers are right; it tells you whether the wiring is still intact.
+This section is the lightest sanity check — running the whole pipeline end-to-end with fake (mock/oracle) captioners just to see if anything crashes. It doesn't tell you whether the numbers are right; it tells you whether the wiring (data → captioner → retrieve → eval) is still intact.
 
 Two end-to-end runs verify the pipeline:
 
@@ -918,12 +918,12 @@ If you prefer to go straight to using a GPU to test if you can replicate the bas
   export HF_HOME=/scratch/$USER/hf_cache
   ```
 
-#### One-shot setup
+#### Setup + run
 
-Clone this repo and `speechQwen2VL` as siblings, then run the setup
-script:
+Clone this repo and `speechQwen2VL` as siblings, then run setup once + the baseline:
 
 ```bash
+# ── First-time setup ─────────────────────────────────────
 cd ~/CSprojects   # (or wherever; just keep them siblings)
 git clone https://github.com/ZhuoyuanJiang/speechQwen2VL.git
 git clone https://github.com/ZhuoyuanJiang/fashion-retrieval-agent.git
@@ -935,26 +935,25 @@ bash scripts/setup_server.sh
 
 conda activate fashion_retrieval
 bash scripts/setup_datasets.sh   # FACap + FashionIQ + Fashion200k annotations
-```
 
-#### One-shot run
-
-```bash
+# ── Run the baseline ─────────────────────────────────────
+# Defaults baked into the script: n_eval=1000, db_size=59082 (full FACap dress
+# targets), vlm=speechqwen2vl, run_name=baseline_v1_speechqwen2vl.
+# To override, prefix matching env vars before the command, e.g.:
+#   N_EVAL=50 RUN_NAME=smoke_real bash scripts/run_baseline_v1.sh   # 50-query smoke
 bash scripts/run_baseline_v1.sh
 ```
 
-Defaults: `n_eval=1000`, `db_size=59082` (full FACap dress targets),
-`vlm=speechqwen2vl`, `run_name=baseline_v1_speechqwen2vl`. Override
-via env vars (e.g.
-`N_EVAL=50 RUN_NAME=smoke_real bash scripts/run_baseline_v1.sh` for
-a quick smoke first).
-
-The script does three things:
-1. Pre-fetches the eval slice's reference images into the local cache
-   (no surprise network calls mid-run).
-2. Runs the baseline: VLM caption-generation + text-to-text retrieval
-   against the 59k FACap dress target captions.
-3. Pretty-prints `metrics.json`.
+`run_baseline_v1.sh` does three things:
+1. Pre-fetches the eval slice's reference images into local cache, so the
+   main eval loop doesn't stall on image downloads mid-run.
+2. Runs the baseline (VLM caption generation + text-to-text retrieval over
+   the 59k FACap dress target captions), writing all artifacts to
+   `runs/<run_name>/`.
+3. Pretty-prints `metrics.json` to the terminal — that's the
+   Recall@1/5/10/50, median + mean rank summary. All the other files in the
+   output tree below were already written in step 2; only this summary is
+   shown in stdout.
 
 Outputs land under `runs/<run_name>/`:
 
