@@ -28,7 +28,7 @@ sleeves"), retrieve the matching item from a fashion catalog. See
 
 **🛠 Running & training**
 - [Recipes](#recipes) — exact commands to reproduce each pipeline
-- [Caption baseline (deep guide)](#caption-baseline-deep-guide) — source code map + smoke + full single-GPU run (Recipes 1–3)
+- [Replicate caption baseline (deep guide)](#replicate-caption-baseline-deep-guide) — source code map + smoke + full single-GPU run (Recipes 1–3)
 - [Contrastive training (deep guide)](#contrastive-training-deep-guide) — multi-GPU hardware/env + launch scripts (Recipes 4–7)
 
 **📚 Meta**
@@ -775,7 +775,7 @@ First contrastive recipe. Query tower is a trainable Qwen2VL; target is the froz
 - **R@10**: 0.402 — **regressed** from the 0.533 Phase-A baseline
 - **Why it matters**: the regression revealed the ceiling — the query tower was capped at FashionCLIP's discrimination. Motivated Recipe 5.
 
-### Recipe 5 — Two-tower Qwen2VL, separate backbones (Plan-10 Option B) ✅ final
+### Recipe 5 — Two-tower Qwen2VL, separate backbones (Plan-10 Option B)
 
 Both query and target are trainable Qwen2VL towers. Embedding space co-constructed during training instead of inherited from a frozen teacher.
 
@@ -814,12 +814,12 @@ Once Recipe 6 (shared-backbone two-tower) emerged as the best text-side architec
 
 ---
 
-## Caption baseline (deep guide)
+## Replicate caption baseline (deep guide)
 
-For those of you who want to replicate the baseline, this section bundles everything you need to actually run the caption-based baseline pipelines (Recipes 1–3). The code lives under `src/` — see [§Baseline code map (`src/`)](#baseline-code-map-src) below for the file-by-file breakdown (data loader, encoder, VLM captioner, retrieve, eval) — and you can run it two ways:
+For those of you who want to replicate the baseline, this section bundles everything you need to actually run all components of the caption-based baseline pipelines (Recipes 1–3) and understand them. The code lives under `src/` — see [§Baseline code map (`src/`)](#baseline-code-map-src) below for the file-by-file breakdown (data loader, encoder, VLM captioner, retrieve, eval) — and you can run it two ways:
 
-- **Laptop verification (CPU only)** — see [§CPU run (laptop verification)](#cpu-run-laptop-verification) below. Runs the full pipeline end-to-end with a *mock* (returns fixed strings) or *oracle* (returns the ground-truth target caption) captioner instead of the real ~7B VLM, so the whole thing finishes in seconds on CPU. This does **not** produce real R@10 numbers; it just confirms the data → captioner → retrieve → eval wiring works. Use it to read the code while watching it execute, or to catch bugs before spending GPU time on a real run.
-- **Reproducing the R@10 numbers (0.240 / 0.533 / 0.586) on a GPU server** — see [§Full single-GPU run on a server](#full-single-gpu-run-on-a-server) below. The real run that swaps in the actual VLM captioner (Qwen2VL) and produces the headline R@10 numbers over the 1,000-query FACap dress slice. Same run that Recipe 1–3's Launch commands kick off, with explicit hardware/env setup and troubleshooting included.
+- **CPU-only verification using your local laptop** — see [§CPU run (laptop verification)](#cpu-run-laptop-verification) below. Runs the full pipeline end-to-end with a *mock* (returns fixed strings) or *oracle* (returns the ground-truth target caption) captioner instead of the real ~7B VLM (the real captioner we use), so the whole thing finishes in seconds on CPU. This does **not** produce real R@10 numbers; it just confirms the data → captioner → retrieve → eval wiring works. Use it to read the code while watching it execute, or to catch bugs before spending GPU time on a real run.
+- **GPU verification on a GPU server to try reproducing the R@10 numbers (0.240 / 0.533 / 0.586)** — see [§Full single-GPU run on a server](#full-single-gpu-run-on-a-server) below. The real run that swaps in the actual VLM captioner (Qwen2VL) and produces the headline R@10 numbers over the 1,000-query FACap dress slice. Same run that Recipe 1–3's Launch commands kick off, with explicit hardware/env setup and troubleshooting included.
 
 ### Baseline code map (`src/`)
 
@@ -846,7 +846,7 @@ the bird's-eye phase roadmap is in
 
 ### CPU run (laptop verification)
 
-**Optional, CPU-only.** If you cloned the repo and want to make sure the code works *before* committing to a real GPU run, this is the path. Smoke runs use mock/oracle VLMs (no real model needed) and complete in seconds; unit tests are persistent regression checks for the data loader, encoder, index, and eval components. **Skip this subsection if you only want the R@K numbers** — go straight to [§Full single-GPU run on a server](#full-single-gpu-run-on-a-server) below.
+**Optional, CPU-only.** If you cloned the repo and want to make sure the code works *before* committing to a real GPU run, this is the path. Smoke runs use mock/oracle VLMs (no real model needed) and complete in seconds; unit tests are checks that live in `tests/` and rerun on every change, to catch when a previously-working component (data loader, encoder, index, eval) silently breaks. **Skip this subsection if you only want to replicate the R@10 numbers, or if you prefer to go straight to using a GPU** — see [§Full single-GPU run on a server](#full-single-gpu-run-on-a-server) below.
 
 The baseline code runs in a dedicated **conda** env (separate from the dataset-exploration `data_exploration/venv/` above):
 
@@ -857,7 +857,9 @@ conda activate fashion_retrieval
 
 Local 8 GB-VRAM laptops can run the mock and oracle backends; the real VLM backends (`qwen2vl`, `speechqwen2vl`) raise a clear `server-only` RuntimeError below 14 GB VRAM and are intended for the GPU server.
 
-#### Smoke runs
+#### Whole Pipeline Check / Smoke runs
+
+This section is the lightest sanity check — running the whole pipeline end-to-end with fake (mock/oracle) captioners just to see if anything crashes. It doesn't tell you whether the numbers are right; it tells you whether the wiring is still intact.
 
 Two end-to-end runs verify the pipeline:
 
@@ -875,11 +877,15 @@ Outputs land under `runs/smoke_{oracle,mock}/` (gitignored): the
 auto-built caption DB at `caption_db/`, `metrics.json`, and
 `qualitative/results.jsonl`.
 
-#### Tests
+#### Per Component Checks / Unit tests
 
-Persistent reproducibility checks for M1–M3 — 13 cases across three
-files. Each file is runnable as a script (no pytest dependency) and
-also discoverable by pytest:
+This section checks each piece of the pipeline individually (vs the whole-pipeline check above, which runs the pipeline as one) — does the data loader still return the documented dict schema, does the caption DB build still write the right embeddings + metadata, and does the pipeline orchestrator still wire captioner → encoder → retrieve → eval correctly?
+
+- **Data loader (`FacapDataset`)** — each item should look like a 6-key dict with keys `candidate_image_path`, `modification_text`, `target_image_path`, `target_caption`, `target_id`, `candidate_id`. Each `candidate_image_path` and `target_image_path` should resolve to a real cached image on disk. The full dataset should contain at least 50k triplets.
+- **Caption DB build (`build_db()`)** — should write an `embeddings.npy` of the right shape with L2-normalized rows, a matching `metadata.jsonl`, and a `config.json` recording encoder + build args + FACap commit (provenance).
+- **Pipeline orchestrator (`run_baseline.run()`)** — should wire captioner → encoder → retrieve → eval correctly. With the **oracle** backend, it should hit **perfect Recall@1** (proves the plumbing). With the **mock** backend, it should run to completion and write the expected artifacts.
+
+13 reproducibility cases across the three files. Each file runs as a script (no pytest dependency) or via pytest:
 
 ```bash
 # Each milestone individually (script mode, prints ✓/✗ per case)
@@ -896,9 +902,9 @@ collide with your smoke runs.
 
 ### Full single-GPU run on a server
 
-**This is the deep how-to for the Launch commands in Recipes 1–3 — the actual single-GPU run that produces R@10 = 0.240 (MiniLM) / 0.533 (FashionCLIP) / 0.586 (Qwen3-Emb-8B).** Run the headline baseline (`speechqwen2vl` backend, 1000-query FACap dress eval slice) on a GPU box. The smoke runs above use mock/oracle captioners and run on CPU; the real VLM run needs a GPU.
+If you prefer to go straight to using a GPU to test if you can replicate the baseline, this section walks you through the actual single-GPU run that produces R@10 = 0.240 (MiniLM) / 0.533 (FashionCLIP) / 0.586 (Qwen3-Emb-8B). The run launches the headline baseline (`speechqwen2vl` backend, 1,000-query FACap dress eval slice) on a GPU box. Unlike the [§CPU run](#cpu-run-laptop-verification) above (mock/oracle captioners on CPU), this real VLM run needs a GPU.
 
-#### Hardware & setup (single-GPU caption-retrieval inference)
+#### Hardware & setup requirements (single-GPU caption-retrieval inference)
 
 - **NVIDIA GPU with ≥ 14 GB VRAM at bf16.** Qwen2-VL-7B occupies
   ~15 GB once image tokens are in the mix. Single GPU is enough.
@@ -922,17 +928,14 @@ cd ~/CSprojects   # (or wherever; just keep them siblings)
 git clone https://github.com/ZhuoyuanJiang/speechQwen2VL.git
 git clone https://github.com/ZhuoyuanJiang/fashion-retrieval-agent.git
 cd fashion-retrieval-agent
+
+# Heads up: setup_server.sh installs the forked transformers + qwen-vl-utils
+# LAST, so sentence-transformers' upstream transformers doesn't override them.
 bash scripts/setup_server.sh
+
 conda activate fashion_retrieval
 bash scripts/setup_datasets.sh   # FACap + FashionIQ + Fashion200k annotations
 ```
-
-`setup_server.sh` creates the `fashion_retrieval` conda env from
-`environment.yml`, installs `requirements.txt`, then shells out to
-`speechQwen2VL/scripts/setup_forks.sh` to install the forked
-`transformers` + `qwen-vl-utils` (these must be installed *last* so
-they override the upstream `transformers` that `sentence-transformers`
-brings in).
 
 #### One-shot run
 
