@@ -13,7 +13,6 @@ sleeves"), retrieve the matching item from a fashion catalog. See
 - [Project motivation](#project-motivation) — what the system does and why
 - [Demo](#demo) — what the running app looks like
 - [Quick Start](#-quick-start) — 4-step path to the running demo
-- [Demo: beyond cached mode](#demo-beyond-cached-mode) — env vars to enable live retrieval, live audio recording, custom paths
 - [Headline result](#headline-result)
 
 **🔧 Install & data**
@@ -29,10 +28,8 @@ sleeves"), retrieve the matching item from a fashion catalog. See
 
 **🛠 Running & training**
 - [Recipes](#recipes) — exact commands to reproduce each pipeline
-- [Baseline pipeline](#baseline-pipeline-src) — what each file in `src/` does
-- [Running the baseline](#running-the-baseline) — CPU smoke + unit tests
-- [Real VLM baseline on a server](#real-vlm-baseline-on-a-server) — single-GPU Qwen2VL caption baseline
-- [Phase B: Contrastive training](#phase-b-contrastive-training-plans-510) — multi-GPU contrastive training
+- [Caption baseline (deep guide)](#caption-baseline-deep-guide) — source code map + smoke + full single-GPU run (Recipes 1–3)
+- [Contrastive training (deep guide)](#contrastive-training-deep-guide) — multi-GPU hardware/env + launch scripts (Recipes 4–7)
 
 **📚 Meta**
 - [Documentation index](#documentation-index)
@@ -78,11 +75,11 @@ catalog (59K items). Source: [`src/demo/app.py`](src/demo/app.py).
 
 **Requirements:** Python 3.10+, conda, NVIDIA GPU with ≥16 GB VRAM (the demo loads a frozen 7B speech-VLM + the LoRA adapters on top).
 
-Get the demo running in 4 steps. (For anything past the cached demo — your own
-queries, training, the exploration notebook — see [§Demo: beyond cached
-mode](#demo-beyond-cached-mode) and [§Download original
-data](#download-original-data); training any pipeline from scratch is in
-[§Recipes](#recipes).)
+Get the demo running in 4 steps. (For training a pipeline from scratch see
+[§Recipes](#recipes); for data fetching beyond what these 4 steps cover see
+[§Download original data](#download-original-data); for non-default demo
+modes — your own queries, custom paths, live audio recording — see the
+**Beyond cached mode** expandable at the bottom of this section.)
 
 ### 1. Clone + create conda env
 
@@ -119,21 +116,13 @@ bash scripts/run_demo.sh        # opens http://localhost:7860
 
 Open [http://localhost:7860](http://localhost:7860) and try it.
 
-For non-default modes (live audio recording, live retrieval, custom port,
-non-default paths), see [§Demo: beyond cached
-mode](#demo-beyond-cached-mode) below.
-
----
-
-## Demo: beyond cached mode
-
 <details>
-<summary><b>Click to expand</b> — env-var recipes for live audio recording, live retrieval, custom paths, custom port</summary>
+<summary><b>Beyond cached mode</b> — env-var recipes for live audio recording, live retrieval, custom paths, custom port</summary>
 
 <br>
 
-The [Quick Start](#-quick-start) above runs the demo in **cached mode** — 8
-preset queries with pre-computed top-K results, no GPU at request time. You
+Steps 1–4 above run the demo in **cached mode** — 8 preset queries with
+pre-computed top-K results, no GPU at request time. You
 can also run the demo with your own image + spoken query (instead of the 8
 presets), enable live audio recording, override default paths on a fresh
 machine, or change the Gradio port/sharing. Set env vars before launching
@@ -197,7 +186,7 @@ Full env-var list with defaults at the top of
 [Model architecture](#model-architecture-training-view) ·
 [Results](#results) ·
 [Recipes](#recipes) ·
-[Phase B training](#phase-b-contrastive-training-plans-510) ·
+[Contrastive training](#contrastive-training-deep-guide) ·
 [Demo](#demo) ·
 [Docs](#documentation-index)
 
@@ -225,7 +214,7 @@ that needs more setup. **Pick by your goal:**
   needs the [dataset annotations](#annotations--240-mb-json-no-images) +
   the full image catalogs
   ([§Full image downloads](#full-image-downloads-training-time)) + a multi-GPU
-  server ([§Phase B](#phase-b-contrastive-training-plans-510)).
+  server ([§Contrastive training](#contrastive-training-deep-guide)).
 
 - **Re-train the audio-native model from scratch** → same as training above,
   plus the ~56K-clip synthetic spoken-modification audio dataset
@@ -825,7 +814,14 @@ Once Recipe 6 (shared-backbone two-tower) emerged as the best text-side architec
 
 ---
 
-## Baseline pipeline (`src/`)
+## Caption baseline (deep guide)
+
+For those of you who want to replicate the baseline, this section bundles everything you need to actually run the caption-based baseline pipelines (Recipes 1–3). The code lives under `src/` — see [§Baseline code map (`src/`)](#baseline-code-map-src) below for the file-by-file breakdown (data loader, encoder, VLM captioner, retrieve, eval) — and you can run it two ways:
+
+- **Laptop verification (CPU only)** — see [§CPU run (laptop verification)](#cpu-run-laptop-verification) below. Runs the full pipeline end-to-end with a *mock* (returns fixed strings) or *oracle* (returns the ground-truth target caption) captioner instead of the real ~7B VLM, so the whole thing finishes in seconds on CPU. This does **not** produce real R@10 numbers; it just confirms the data → captioner → retrieve → eval wiring works. Use it to read the code while watching it execute, or to catch bugs before spending GPU time on a real run.
+- **Reproducing the R@10 numbers (0.240 / 0.533 / 0.586) on a GPU server** — see [§Full single-GPU run on a server](#full-single-gpu-run-on-a-server) below. The real run that swaps in the actual VLM captioner (Qwen2VL) and produces the headline R@10 numbers over the 1,000-query FACap dress slice. Same run that Recipe 1–3's Launch commands kick off, with explicit hardware/env setup and troubleshooting included.
+
+### Baseline code map (`src/`)
 
 The text-modification retrieval baseline (Plan_2). Method: turn
 `(reference image + modification text)` into an "imagined target caption"
@@ -848,24 +844,20 @@ System-design diagrams + per-milestone execution log live in
 the bird's-eye phase roadmap is in
 [`Documentation/Plan_overview.md`](Documentation/Plan_overview.md).
 
-## Running the baseline
+### CPU run (laptop verification)
 
-### Conda env
+**Optional, CPU-only.** If you cloned the repo and want to make sure the code works *before* committing to a real GPU run, this is the path. Smoke runs use mock/oracle VLMs (no real model needed) and complete in seconds; unit tests are persistent regression checks for the data loader, encoder, index, and eval components. **Skip this subsection if you only want the R@K numbers** — go straight to [§Full single-GPU run on a server](#full-single-gpu-run-on-a-server) below.
 
-The baseline code runs in a dedicated **conda** env (separate from
-the dataset-exploration `data_exploration/venv/` above):
+The baseline code runs in a dedicated **conda** env (separate from the dataset-exploration `data_exploration/venv/` above):
 
 ```bash
 conda env create -f environment.yml
 conda activate fashion_retrieval
 ```
 
-Local 8 GB-VRAM laptops can run the mock and oracle backends; the
-real VLM backends (`qwen2vl`, `speechqwen2vl`) raise a clear
-`server-only` RuntimeError below 14 GB VRAM and are intended for the
-GPU server.
+Local 8 GB-VRAM laptops can run the mock and oracle backends; the real VLM backends (`qwen2vl`, `speechqwen2vl`) raise a clear `server-only` RuntimeError below 14 GB VRAM and are intended for the GPU server.
 
-### Smoke runs
+#### Smoke runs
 
 Two end-to-end runs verify the pipeline:
 
@@ -883,7 +875,7 @@ Outputs land under `runs/smoke_{oracle,mock}/` (gitignored): the
 auto-built caption DB at `caption_db/`, `metrics.json`, and
 `qualitative/results.jsonl`.
 
-### Tests
+#### Tests
 
 Persistent reproducibility checks for M1–M3 — 13 cases across three
 files. Each file is runnable as a script (no pytest dependency) and
@@ -902,13 +894,11 @@ pytest tests/
 Tests build into fresh `runs/_test_*/` directories so they don't
 collide with your smoke runs.
 
-## Real VLM baseline on a server
+### Full single-GPU run on a server
 
-Run the headline baseline (`speechqwen2vl` backend, 1000-query FACap
-dress eval slice) on a GPU box. The smoke runs above use mock/oracle
-captioners and run on CPU; the real VLM run needs a GPU.
+**This is the deep how-to for the Launch commands in Recipes 1–3 — the actual single-GPU run that produces R@10 = 0.240 (MiniLM) / 0.533 (FashionCLIP) / 0.586 (Qwen3-Emb-8B).** Run the headline baseline (`speechqwen2vl` backend, 1000-query FACap dress eval slice) on a GPU box. The smoke runs above use mock/oracle captioners and run on CPU; the real VLM run needs a GPU.
 
-### Hardware & setup (single-GPU caption-retrieval inference)
+#### Hardware & setup (single-GPU caption-retrieval inference)
 
 - **NVIDIA GPU with ≥ 14 GB VRAM at bf16.** Qwen2-VL-7B occupies
   ~15 GB once image tokens are in the mix. Single GPU is enough.
@@ -922,7 +912,7 @@ captioners and run on CPU; the real VLM run needs a GPU.
   export HF_HOME=/scratch/$USER/hf_cache
   ```
 
-### One-shot setup
+#### One-shot setup
 
 Clone this repo and `speechQwen2VL` as siblings, then run the setup
 script:
@@ -944,7 +934,7 @@ bash scripts/setup_datasets.sh   # FACap + FashionIQ + Fashion200k annotations
 they override the upstream `transformers` that `sentence-transformers`
 brings in).
 
-### One-shot run
+#### One-shot run
 
 ```bash
 bash scripts/run_baseline_v1.sh
@@ -979,7 +969,7 @@ runs/baseline_v1_speechqwen2vl/
 
 Takes ~20–30 minutes on a single GPU (most time is VLM forward passes).
 
-### Troubleshooting
+#### Troubleshooting
 
 - **`RuntimeError: server-only: ... needs ≥ 14.0 GB VRAM`** — the
   selected GPU is too small. Pick a different one with
@@ -996,9 +986,11 @@ Takes ~20–30 minutes on a single GPU (most time is VLM forward passes).
   Either delete the run dir or use a fresh `--run-name`. The error
   message names the offending arg(s).
 
-## Phase B: Contrastive training (Plans 5–10)
+## Contrastive training (deep guide)
 
-The training pipeline for Phase B contrastive recipes (Recipes 4, 5, 6).
+This section bundles the **shared infrastructure** for training any of the contrastive recipes (Recipes 4–7): hardware requirements, env vars, launch scripts, and W&B setup. **All 4 contrastive recipes need the same hardware + env vars** — the per-recipe difference is just the launch flag (see each Recipe's Launch line in [§Recipes](#recipes) above).
+
+The per-Plan subsections below ([§Plan-6](#plan-6-query-tower-contrastive-frozen-fashionclip-target) and [§Plan-10/13](#plan-1013-two-tower-co-trained-best-text)) walk through each Recipe's actual training script — useful if you want to understand or modify the training loop. Skip them if you only need to launch.
 
 ### Hardware & setup (multi-GPU contrastive training)
 
