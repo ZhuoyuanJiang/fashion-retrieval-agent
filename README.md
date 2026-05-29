@@ -1056,29 +1056,46 @@ The full design and execution history lives in [`Documentation/`](Documentation/
 3. [`Plan_5_20260501.md`](Documentation/Plan_5_20260501.md) → `Plan_7_20260503.md` + corresponding Progress — Plan-6 query-tower contrastive recipe.
 4. [`Plan_9_20260504.md`](Documentation/Plan_9_20260504.md) + [`Progress_9_20260505.md`](Documentation/Progress_9_20260505.md) — detailed-vs-concise VLM caption ablation.
 5. [`Plan_10_20260510.md`](Documentation/Plan_10_20260510.md) + [`Progress_10_20260512.md`](Documentation/Progress_10_20260512.md) + [`Progress_11_20260512.md`](Documentation/Progress_11_20260512.md) — two-tower co-trained architecture (current best).
-6. [`meeting_memo_20260503.md`](Documentation/meeting_memo_20260503.md) — mentor feedback that motivated Plan 10.
 
 ---
 
 ## Repo structure
 
-- `Documentation/` — proposals, plans, progress reports, meeting memos.
-- `data_exploration/` — inspection notebook, sample fetchers, scratch space.
+- `src/` — main implementation
+  - `baseline/` — caption baseline (Recipes 1–3): VLM captioners (mock/oracle/Qwen2VL/speech-Qwen2VL), text-encoder zoo, caption DB builder, retrieve + eval. Entry point: `run_baseline.py`.
+  - `training/` — two-tower contrastive training (Recipes 4–7): shared/separate-backbone models, multi-positive InfoNCE loss, online eval, target-embedding cache. Entry points: `train_plan5.py` (Plan-6 query-tower), `train_plan10.py` (Plan-10/12/13/15 two-tower).
+  - `data/` — dataset loaders: `FacapDataset` (CIR triplets), contrastive batch builder, TTS audio builder.
+  - `demo/` — Gradio demo app: gallery, presets, cached-mode precompute.
+- `scripts/` — reproducibility scripts:
+  - `setup_server.sh` / `setup_datasets.sh` — env + dataset setup
+  - `run_baseline_v1.sh` / `run_encoder_swap.sh` — caption baseline launchers (Recipes 1–3)
+  - `run_plan5.sh` / `run_plan10.sh` — contrastive training launchers (Recipes 4–7)
+  - `run_demo.sh` — Gradio demo launcher
+  - `fetch_artifacts.sh` — pull checkpoints + demo assets from HF Hub
+  - `run_tts_synth.sh` — synthesize spoken-modification audio for Plan-15
+  - `make_demo_thumbs.py` — generate demo gallery thumbnails
+- `tests/` — runnable test suite for the baseline (13 cases):
+  - `test_m1_facap_dataset.py` — `FacapDataset` schema + image resolution
+  - `test_m2_caption_db.py` — `build_db()` shape + L2-normalization + provenance
+  - `test_m3_pipeline.py` — orchestrator wiring (oracle hits Recall@1 = 1.0)
+- `notebooks/` — exploration notebooks:
+  - `caption_analysis_baseline_v1.ipynb` + `_v2_20260504.ipynb` — caption-quality exploration
+  - `baseline_demo.ipynb` — baseline pipeline walk-through
+  - `audio_dataset_demo.ipynb` — TTS audio dataset preview
+- `data_exploration/` — sample fetchers + scratch space:
+  - `dataset_inspection.ipynb` — FACap triplet browser
+  - `fetch_facap_sample.py` — pulls a small image sample for the notebook
+  - `notes_facap_dataset.md` — inspection notes
 - `demo_assets/` — cached data the demo loads at startup:
   ```
-  demo_assets/
-  ├── preset_cache.json    8 preset queries + cached top-K results per pipeline
-  ├── preset_audio/        TTS audio for each preset's spoken modification (~2.4 MB)
-  ├── survey.jsonl         past-user feedback notes
-  └── preset_thumbs/       gitignored — product image thumbnails the demo gallery
-                           shows. Generate locally with
-                           `python scripts/make_demo_thumbs.py` (needs FACap images
-                           first; run `bash scripts/fetch_artifacts.sh --with-images`).
+  preset_cache.json    8 preset queries + cached top-K per pipeline
+  preset_audio/        TTS audio for each preset's spoken modification (~2.4 MB)
+  survey.jsonl         past-user feedback notes
+  preset_thumbs/       gitignored — generate with `python scripts/make_demo_thumbs.py`
+                       (needs FACap images first: `bash scripts/fetch_artifacts.sh --with-images`)
   ```
-- `scripts/` — reproducibility helpers.
-- `src/` — baseline implementation (Plan_2 M1–M3); entry point is `src/baseline/run_baseline.py`.
-- `tests/` — runnable test suite for M1–M3 (13 cases).
-- `runs/` — gitignored: caption DBs, metrics, qualitative dumps.
+- `Documentation/` — plans, progress reports, design rationale (see [§Documentation index](#documentation-index) above for reading order)
+- `runs/`, `logs/`, `wandb/`, `__pycache__/` — gitignored (generated at runtime)
 
 ## Acknowledgments
 
