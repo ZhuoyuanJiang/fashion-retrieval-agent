@@ -1061,41 +1061,70 @@ The full design and execution history lives in [`Documentation/`](Documentation/
 
 ## Repo structure
 
-- `src/` — main implementation
-  - `baseline/` — caption baseline (Recipes 1–3): VLM captioners (mock/oracle/Qwen2VL/speech-Qwen2VL), text-encoder zoo, caption DB builder, retrieve + eval. Entry point: `run_baseline.py`.
-  - `training/` — two-tower contrastive training (Recipes 4–7): shared/separate-backbone models, multi-positive InfoNCE loss, online eval, target-embedding cache. Entry points: `train_plan5.py` (Plan-6 query-tower), `train_plan10.py` (Plan-10/12/13/15 two-tower).
-  - `data/` — dataset loaders: `FacapDataset` (CIR triplets), contrastive batch builder, TTS audio builder.
-  - `demo/` — Gradio demo app: gallery, presets, cached-mode precompute.
-- `scripts/` — reproducibility scripts:
-  - `setup_server.sh` / `setup_datasets.sh` — env + dataset setup
-  - `run_baseline_v1.sh` / `run_encoder_swap.sh` — caption baseline launchers (Recipes 1–3)
-  - `run_plan5.sh` / `run_plan10.sh` — contrastive training launchers (Recipes 4–7)
-  - `run_demo.sh` — Gradio demo launcher
-  - `fetch_artifacts.sh` — pull checkpoints + demo assets from HF Hub
-  - `run_tts_synth.sh` — synthesize spoken-modification audio for Plan-15
-  - `make_demo_thumbs.py` — generate demo gallery thumbnails
-- `tests/` — runnable test suite for the baseline (13 cases):
-  - `test_m1_facap_dataset.py` — `FacapDataset` schema + image resolution
-  - `test_m2_caption_db.py` — `build_db()` shape + L2-normalization + provenance
-  - `test_m3_pipeline.py` — orchestrator wiring (oracle hits Recall@1 = 1.0)
-- `notebooks/` — exploration notebooks:
-  - `caption_analysis_baseline_v1.ipynb` + `_v2_20260504.ipynb` — caption-quality exploration
-  - `baseline_demo.ipynb` — baseline pipeline walk-through
-  - `audio_dataset_demo.ipynb` — TTS audio dataset preview
-- `data_exploration/` — sample fetchers + scratch space:
-  - `dataset_inspection.ipynb` — FACap triplet browser
-  - `fetch_facap_sample.py` — pulls a small image sample for the notebook
-  - `notes_facap_dataset.md` — inspection notes
-- `demo_assets/` — cached data the demo loads at startup:
-  ```
-  preset_cache.json    8 preset queries + cached top-K per pipeline
-  preset_audio/        TTS audio for each preset's spoken modification (~2.4 MB)
-  survey.jsonl         past-user feedback notes
-  preset_thumbs/       gitignored — generate with `python scripts/make_demo_thumbs.py`
-                       (needs FACap images first: `bash scripts/fetch_artifacts.sh --with-images`)
-  ```
-- `Documentation/` — plans, progress reports, design rationale (see [§Documentation index](#documentation-index) above for reading order)
-- `runs/`, `logs/`, `wandb/`, `__pycache__/` — gitignored (generated at runtime)
+```
+fashion-retrieval-agent/
+├── src/                                              # Main implementation
+│   ├── baseline/                                     # Caption baseline (Recipes 1–3)
+│   │   ├── run_baseline.py                           # Orchestrator: VLM caption → encode → retrieve → eval
+│   │   ├── vlm_caption.py                            # Captioner zoo: mock / oracle / Qwen2VL / speech-Qwen2VL
+│   │   ├── text_encoder.py                           # Sentence-BERT default text encoder
+│   │   ├── encoder_zoo.py                            # 11-encoder swap surface (FashionCLIP, Qwen3-Emb-8B, …)
+│   │   ├── build_caption_db.py                       # Build embeddings.npy + metadata.jsonl + config.json
+│   │   ├── retrieve.py                               # Cosine top-K + true-target rank
+│   │   ├── eval.py                                   # Recall@K + median/mean rank + qualitative JSONL
+│   │   └── prepare_images.py                         # Pre-fetch eval-slice images
+│   ├── training/                                     # Two-tower contrastive training (Recipes 4–7)
+│   │   ├── train_plan10.py                           # Two-tower co-train (Plan-10/12/13/15)
+│   │   ├── train_plan5.py                            # Query-tower contrastive (Plan-6, Recipe 4)
+│   │   ├── two_tower_model.py                        # Shared / separate-backbone PEFT model
+│   │   ├── contrastive_model.py                      # Single-tower contrastive model
+│   │   ├── loss.py                                   # Multi-positive InfoNCE + cross-GPU gather
+│   │   ├── online_eval.py                            # Dev R@K eval during training
+│   │   └── target_cache.py                           # Target-side embedding cache
+│   ├── data/                                         # Dataset loaders + TTS audio builder
+│   │   ├── facap_dataset.py                          # FacapDataset (CIR triplets)
+│   │   ├── contrastive_dataset.py                    # Contrastive batch builder
+│   │   └── build_tts_audio.py                        # Synthesize spoken modifications (Plan-15)
+│   └── demo/                                         # Gradio demo app
+│       ├── app.py                                    # Demo entry point
+│       ├── gallery.py                                # Gradio gallery UI
+│       ├── config.py                                 # Demo config
+│       ├── precompute_presets.py                     # Build the 8 cached preset top-Ks
+│       └── precompute_two_tower.py                   # Two-tower preset variant
+├── scripts/                                          # Setup + reproducibility scripts
+│   ├── setup_server.sh                               # First-time env setup
+│   ├── setup_datasets.sh                             # FACap + FashionIQ + Fashion200k annotations
+│   ├── run_baseline_v1.sh                            # Caption baseline launcher (Recipes 1–3)
+│   ├── run_encoder_swap.sh                           # Encoder ablation launcher
+│   ├── run_plan5.sh                                  # Plan-6 query-tower launcher (Recipe 4)
+│   ├── run_plan10.sh                                 # Plan-10/12/13/15 two-tower launcher (Recipes 5–7)
+│   ├── run_demo.sh                                   # Gradio demo launcher
+│   ├── fetch_artifacts.sh                            # Pull checkpoints + demo assets from HF Hub
+│   ├── run_tts_synth.sh                              # Synthesize Plan-15 spoken-modification audio
+│   └── make_demo_thumbs.py                           # Generate demo gallery thumbnails
+├── tests/                                            # Runnable test suite (13 cases, M1–M3)
+│   ├── test_m1_facap_dataset.py                      # FacapDataset schema + image resolution
+│   ├── test_m2_caption_db.py                         # build_db() shape + L2-norm + provenance
+│   └── test_m3_pipeline.py                           # Orchestrator wiring (oracle hits Recall@1 = 1.0)
+├── notebooks/                                        # Exploration notebooks
+│   ├── caption_analysis_baseline_v1.ipynb            # Caption-quality exploration (v1)
+│   ├── caption_analysis_baseline_v2_20260504.ipynb   # Caption-quality exploration (v2)
+│   ├── baseline_demo.ipynb                           # Baseline pipeline walk-through
+│   └── audio_dataset_demo.ipynb                      # TTS audio dataset preview
+├── data_exploration/                                 # Sample fetchers + dataset inspection
+│   ├── dataset_inspection.ipynb                      # FACap triplet browser
+│   ├── fetch_facap_sample.py                         # Pulls a small image sample for the notebook
+│   ├── notes_facap_dataset.md                        # Inspection notes
+│   └── datasets/                                     # gitignored — locally-cloned third-party dataset repos
+├── demo_assets/                                      # Cached data the demo loads at startup
+│   ├── preset_cache.json                             # 8 preset queries + cached top-K per pipeline
+│   ├── preset_audio/                                 # TTS audio for each preset's spoken modification
+│   ├── survey.jsonl                                  # Past-user feedback notes
+│   └── preset_thumbs/                                # gitignored — generate via scripts/make_demo_thumbs.py
+└── Documentation/                                    # Plans, progress reports, design rationale (see §Documentation index above)
+```
+
+Also gitignored (generated at runtime): `runs/`, `logs/`, `wandb/`, `__pycache__/`.
 
 ## Acknowledgments
 
