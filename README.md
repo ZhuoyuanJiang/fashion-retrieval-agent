@@ -821,6 +821,11 @@ For those of you who want to replicate the baseline, this section bundles everyt
 - **CPU-only verification using your local laptop** — see [§CPU run (laptop verification)](#cpu-run-laptop-verification) below. Runs the full pipeline end-to-end with a *mock* (returns fixed strings) or *oracle* (returns the ground-truth target caption) captioner instead of the real ~7B VLM (the real captioner we use), so the whole thing finishes in seconds on CPU. This does **not** produce real R@10 numbers; it just confirms the data → captioner → retrieve → eval wiring works. Use it to read the code while watching it execute, or to catch bugs before spending GPU time on a real run.
 - **GPU verification on a GPU server to try reproducing the R@10 numbers (0.240 / 0.533 / 0.586)** — see [§Full single-GPU run on a server](#full-single-gpu-run-on-a-server) below. The real run that swaps in the actual VLM captioner (Qwen2VL) and produces the headline R@10 numbers over the 1,000-query FACap dress slice. Same run that Recipe 1–3's Launch commands kick off, with explicit hardware/env setup and troubleshooting included.
 
+<details>
+<summary><b>📖 Click to expand the walk-through</b> — code map · CPU verification · single-GPU run for R@10 0.240/0.533/0.586</summary>
+
+<br>
+
 ### Baseline code map (`src/`)
 
 The text-modification retrieval baseline (Plan_2). Method: turn
@@ -987,6 +992,8 @@ Takes ~20–30 minutes on a single GPU (most time is VLM forward passes).
   different args (encoder, eval size, FACap commit) than this run.
   Either delete the run dir or use a fresh `--run-name`. The error
   message names the offending arg(s).
+
+</details>
 
 ## Contrastive training (deep guide)
 
