@@ -28,8 +28,8 @@ sleeves"), retrieve the matching item from a fashion catalog. See
 
 **🛠 Running & training**
 - [Recipes](#recipes) — exact commands to reproduce each pipeline
-- [Replicate caption baseline (deep guide)](#replicate-caption-baseline-deep-guide) — source code map + smoke + full single-GPU run (Recipes 1–3)
-- [Contrastive training (deep guide)](#contrastive-training-deep-guide) — multi-GPU hardware/env + launch scripts (Recipes 4–7)
+- [Caption Baseline Reproduction](#caption-baseline-reproduction) — source code map + smoke + full single-GPU run (Recipes 1–3)
+- [Training (Contrastive Learning)](#training-contrastive-learning) — multi-GPU hardware/env + launch scripts (Recipes 4–7)
 
 **📚 Meta**
 - [Documentation index](#documentation-index)
@@ -186,7 +186,7 @@ Full env-var list with defaults at the top of
 [Model architecture](#model-architecture-training-view) ·
 [Results](#results) ·
 [Recipes](#recipes) ·
-[Contrastive training](#contrastive-training-deep-guide) ·
+[Training](#training-contrastive-learning) ·
 [Demo](#demo) ·
 [Docs](#documentation-index)
 
@@ -214,7 +214,7 @@ that needs more setup. **Pick by your goal:**
   needs the [dataset annotations](#annotations--240-mb-json-no-images) +
   the full image catalogs
   ([§Full image downloads](#full-image-downloads-training-time)) + a multi-GPU
-  server ([§Contrastive training](#contrastive-training-deep-guide)).
+  server ([§Training (Contrastive Learning)](#training-contrastive-learning)).
 
 - **Re-train the audio-native model from scratch** → same as training above,
   plus the ~56K-clip synthetic spoken-modification audio dataset
@@ -814,7 +814,7 @@ Once Recipe 6 (shared-backbone two-tower) emerged as the best text-side architec
 
 ---
 
-## Replicate caption baseline (deep guide)
+## Caption Baseline Reproduction
 
 For those of you who want to replicate the baseline, this section bundles everything you need to actually run all components of the caption-based baseline pipelines (Recipes 1–3) and understand them. The code lives under `src/` — see [§Baseline code map (`src/`)](#baseline-code-map-src) below for the file-by-file breakdown (data loader, encoder, VLM captioner, retrieve, eval) — and you can run it two ways:
 
@@ -995,7 +995,7 @@ Takes ~20–30 minutes on a single GPU (most time is VLM forward passes).
 
 </details>
 
-## Contrastive training (deep guide)
+## Training (Contrastive Learning)
 
 This section bundles the **shared infrastructure** for training any of the contrastive recipes (Recipes 4–7): hardware requirements, env vars, launch scripts, and W&B setup. **All 4 contrastive recipes need the same hardware + env vars** — the per-recipe difference is just the launch flag (see each Recipe's Launch line in [§Recipes](#recipes) above).
 
