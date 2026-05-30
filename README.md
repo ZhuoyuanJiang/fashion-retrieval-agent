@@ -40,6 +40,8 @@ sleeves"), retrieve the matching item from a fashion catalog. See
 - [Repo structure](#repo-structure)
 - [Acknowledgments](#acknowledgments)
 - [Licenses](#licenses)
+- [Citation](#citation)
+- [References](#references)
 
 ---
 
@@ -1148,3 +1150,40 @@ Special thanks to **Nima Tajbakhsh** (Nvidia) for valuable technical guidance an
 - Fashion200k / DeepFashion-MultiModal: see source repos.
 - This repo never redistributes third-party image data; all images are fetched
   from upstream at setup time.
+
+---
+
+## Citation
+
+If you find this project useful, please consider citing it:
+
+```bibtex
+@software{jiang2026fashionretrieval,
+  author = {Zhuoyuan Jiang},
+  title  = {Fashion Retrieval Agent: Audio-Conditioned Composed Fashion Retrieval},
+  year   = {2026},
+  url    = {https://github.com/ZhuoyuanJiang/fashion-retrieval-agent}
+}
+```
+
+---
+
+## References
+
+**Datasets**
+
+- **FACap** — composed image-retrieval triplets (the dress slice is the primary benchmark here). [`fgxaos/facap-sigir25-gennext`](https://github.com/fgxaos/facap-sigir25-gennext) (SIGIR 2025).
+- **FashionIQ** — composed fashion retrieval with natural-language feedback. [`XiaoxiaoGuo/fashion-iq`](https://github.com/XiaoxiaoGuo/fashion-iq) (ICCV 2019); ASIN→URL metadata: [`hongwang600/fashion-iq-metadata`](https://github.com/hongwang600/fashion-iq-metadata).
+- **Fashion200k** — fashion product images + attributes. [`xthan/fashion-200k`](https://github.com/xthan/fashion-200k); image mirror: [`Marqo/fashion200k`](https://huggingface.co/datasets/Marqo/fashion200k).
+- **DeepFashion-MultiModal** — auxiliary FACap image source. [`Marqo/deepfashion-multimodal`](https://huggingface.co/datasets/Marqo/deepfashion-multimodal).
+- **VCTK** — multi-speaker English corpus used as the TTS voice bank. [Edinburgh DataShare](https://datashare.ed.ac.uk/handle/10283/3443).
+- **LargeScaleASR** — ASR evaluation set for the speechQwen2VL backbone. [`speechbrain/LargeScaleASR`](https://huggingface.co/datasets/speechbrain/LargeScaleASR).
+
+**Models & methods**
+
+- **Qwen2-VL** — vision-language backbone. [`Qwen/Qwen2-VL-7B-Instruct`](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) (2024).
+- **Marqo-FashionCLIP** — fashion-domain CLIP retrieval baseline. [`Marqo/marqo-fashionCLIP`](https://huggingface.co/Marqo/marqo-fashionCLIP) (2024).
+- **Qwen3-Embedding** — general-purpose text-embedding baseline. [`Qwen/Qwen3-Embedding-8B`](https://huggingface.co/Qwen/Qwen3-Embedding-8B) (2025).
+- **Whisper** — audio encoder feeding the speechQwen2VL backbone. [`openai/whisper`](https://github.com/openai/whisper).
+- **Chatterbox TTS** — zero-shot voice-clone TTS used to synthesize the spoken modifications. [`resemble-ai/chatterbox`](https://github.com/resemble-ai/chatterbox).
+- **speechQwen2VL** — this project's audio-native foundation model (sibling repo). [`ZhuoyuanJiang/speechQwen2VL`](https://github.com/ZhuoyuanJiang/speechQwen2VL).
