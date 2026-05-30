@@ -5,6 +5,10 @@ image and a spoken modification request (e.g. "make it black", "shorter
 sleeves"), retrieve the matching item from a fashion catalog. See
 `Documentation/` for proposals, plans, and progress logs.
 
+![Project Overview](assets/pipeline_overview.png)
+
+<sub>📐 More architecture detail: [End-to-End Project Architecture](#-method-pipeline--architecture-overviews) · [Model Internals — token construction & forward pass](#model-architecture-training-view)</sub>
+
 ---
 
 ## Table of Contents
@@ -408,6 +412,8 @@ selection, WER QC, and voice control — are in
 
 *The retrieval architectures we tried and the pipelines they produced — from caption baselines to the audio-native flagship.*
 
+![End to End Project Architecture](assets/architecture_end_to_end.png)
+
 ---
 
 ## Pipeline comparison
@@ -643,6 +649,8 @@ ONLINE QUERY
 ## Model architecture (training view)
 
 *If you wanted to **actually build and train** the winning two-tower yourself, the diagram below walks through how it's wired up internally — backbone, adapters, pooling, projection head, loss. For **what components you'd need to deploy** this in production, see [§Architecture families (deployment view)](#architecture-families-deployment-view) above.*
+
+![Model Internals: Token Construction & Forward Pass Tensors Overview](assets/architecture_forward_pass.png)
 
 Plan-10 V1 (Pipelines 5 & 6) — **two-tower joint embedding** trained with symmetric multi-positive InfoNCE:
 
